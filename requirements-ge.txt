@@ -1,0 +1,11 @@
+# Isolated environment for Great Expectations validation.
+# Kept separate so the main venv stays on pandas 3.0 (GE 0.18 needs pandas < 3 + numpy < 2).
+#
+# Setup:
+#   python3.14 -m venv .venv-ge
+#   .venv-ge/bin/pip install -r requirements-ge.txt
+#   .venv-ge/bin/python -m ipykernel install --user --name aave-ge --display-name "Python (aave-ge)"
+# Then open validation.ipynb and select the "Python (aave-ge)" kernel.
+great_expectations==0.18.22
+ipykernel
+matplotlib                 # column-diagnostic plots in adv_validation.py
