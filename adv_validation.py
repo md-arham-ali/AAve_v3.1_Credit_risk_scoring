@@ -1,12 +1,9 @@
 """Advanced, finance-aware Great Expectations checks for the Aave V3.1 result tables.
 
-Complements the basic suite in `data_validation.py`. Where the basic suite checks
-structure (nulls, dtypes, key uniqueness, address/time formats), this module adds
-*domain* expectations chosen for the kind of financial value each column holds:
+-This module adds *domain* expectations chosen for the kind of financial value each column holds:
 amounts, interest rates, liquidity indexes, basis-point configs, oracle prices,
 health factors and activity counts.
-
-Runs under `.venv-ge` (Great Expectations 0.18.x, pandas 2.x) — same kernel as
+-Runs under `.venv-ge` (Great Expectations 0.18.x, pandas 2.x) — same kernel as
 `data_validation.py`.
 
 The blockchain decimals problem (important)
@@ -21,9 +18,6 @@ to float64 during arithmetic, corrupting every digit below ~2**53. So:
     `int` (`_to_int`), never with pandas object arithmetic.
 Those exact checks are reported next to the GE results, tagged `custom_*`.
 
-The notebook calls `validate_table_advanced(df, table_name)` per table (that wiring
-is intentionally not written here).
-
 Single-column diagnostics (values + plots)
 ------------------------------------------
 Besides the per-table suites, this module exposes three standalone, decimals-safe
@@ -36,7 +30,7 @@ so the value computations still work in environments without it.
 Statistical pre-EDA validation (univariate, finance-aware)
 ----------------------------------------------------------
 ``statistical_validation(df, table_name=None)`` profiles every numeric column with the
-descriptive statistics and data-quality flags you want settled *before* EDA:
+descriptive statistics and data-quality flags that is to be settled *before* EDA:
 completeness (null %), zero-inflation, cardinality, robust location/scale (median, IQR,
 MAD), quantiles, dispersion (CV), distribution shape (skewness / excess kurtosis) and
 outlier counts (Tukey IQR fence + MAD modified z-score). It is deliberately univariate —
@@ -45,6 +39,19 @@ Decimals-safe (uint256/RAY/WAD strings parsed exactly) and the 2**256-1 no-debt
 health-factor sentinel is counted then excluded so it can't distort the percentiles.
 Returns a tidy one-row-per-column frame, saved to
 ``validation_results/<table>__stat_validation.csv``.
+
+Transformed-frame validation (model-ready frames, Tiers 0-4)
+------------------------------------------------------------
+``validate_transformed_final(df)`` and ``validate_reserve_panel(df)`` validate the two
+post-transform frames in ``transformed_data/`` against ``context/data_val.md``. Unlike the
+suites above (raw uint256 strings, GE), these frames are already scaled floats, so the
+checks are plain pandas/Python and return NUMERIC results — pass-rate %, counts, and the
+offending columns + ``time_bucket`` keys. Five per-tier functions (``tf_tier0_schema`` …
+``tf_tier4_temporal``) each return a one-row-per-check DataFrame so the notebook can show
+one tier per cell; the entry points concatenate them and save
+``validation_results/<frame>__transform_validation.csv``.
+
+To be scaled as required after addition of other feature tables.
 """
 
 import math
@@ -64,13 +71,13 @@ WAD = 10 ** 18               # Aave health-factor fixed point (1.0 == 1e18)
 UINT256_MAX = 2 ** 256 - 1   # health-factor sentinel for accounts with no debt
 BPS_MAX = 10_000             # 100% in basis points
 HF_SANE_CAP = 10 ** 30       # any non-sentinel health factor must sit below this
-MAX_BLOCK = 50_000_000       # generous upper bound for an Ethereum block number
+MAX_BLOCK = 50_000_000       # generous upper bound for an Ethereum block number, though not needed
 
 WINDOW_6H_REGEX = r"^(2025-1[12]|2026-01)-\d{2} (00|06|12|18):00:00"  # window + 6h grid
-ADDRESS_REGEX = r"^0x[0-9a-f]{40}$"          # 20-byte lower-hex address
+ADDRESS_REGEX = r"^0x[0-9a-f]{40}$"          # 20-byte lower-hex address, not checking hashes here
 SYMBOL_REGEX = r"^[A-Za-z0-9._+\-]{1,40}$"   # token tickers incl. PT-style names
 
-# uint256 columns that are non-negative by construction (amounts, rates, indexes, HF)
+# uint256 columns that are non-negative by construction (amounts, rates, indexes, HF), for pre transformation tests
 BIGINT_NONNEG = {
     "supply_amount_raw", "withdrawal_amount_raw",
     "borrow_amount_raw", "repay_amount_raw", "last_borrow_rate",
@@ -80,12 +87,13 @@ BIGINT_NONNEG = {
     "flashloan_amount_raw", "flashloan_premium_raw",
     "min_health_factor", "max_health_factor",
 }
-# int256 columns that are signed (net flows) — only shape + identity, never >= 0
+# int256 columns that are signed (net flows) — only shape + identity, never >= 0, 
+# to be tested on transformed data not raw oon chain data due to decimal mismatch among assets
 BIGINT_SIGNED = {"net_supply_flow_raw", "net_debt_flow_raw"}
 BIGINT_COLS = BIGINT_NONNEG | BIGINT_SIGNED
 
 RESULT_COLS = ["table", "expectation", "column", "success",
-               "element_count", "unexpected_count", "unexpected_percent", "note"]
+               "element_count", "unexpected_count", "unexpected_percent", "note"] # to display a structured final result
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +262,7 @@ def _symbol_consistency_violations(raw, asset_col, symbol_col):
 # prepare() — build the frame GE validates against
 # --------------------------------------------------------------------------- #
 def prepare(df):
-    """Copy df, parse big-int columns to Python ints, and add count-partition helpers."""
+    """Copies df, parse big-int columns to Python ints, and add count-partition helpers."""
     p = df.copy()
     for c in BIGINT_COLS & set(p.columns):
         p[c] = to_int_series(p[c])                       # decimals-safe ints for GE range checks
@@ -931,6 +939,606 @@ def statistical_validation(df, table_name=None, columns=None,
         folder = Path(results_dir)
         folder.mkdir(parents=True, exist_ok=True)
         out.to_csv(folder / f"{name}__stat_validation.csv", index=False)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Transformed-frame validation (the model-ready frames in transformed_data/)
+# --------------------------------------------------------------------------- #
+# The two post-transform frames have a different grain/schema from the raw
+# query_result_data tables validated above, and are already scaled (no uint256
+# strings), so these checks use plain pandas/Python int — exact here — and return
+# tidy NUMERIC results (pass-rate %, counts, offending columns + time_buckets)
+# rather than GE objects. They implement context/data_val.md, Tiers 0-4:
+#   * DF_common_final — protocol-level 6h feature matrix; time_bucket is the PK.
+#   * DF_common_1     — asset-level reserve panel keyed on (time_bucket, asset).
+# One function per tier returns a DataFrame (one row per check); the per-tier
+# results carry tier / check / columns / severity / n_checked / n_pass / n_fail /
+# pass_rate_pct / anomaly_columns / anomaly_buckets / detail.
+
+TRANSFORM_RESULT_COLS = [
+    "tier", "check", "columns", "severity",
+    "n_checked", "n_pass", "n_fail", "pass_rate_pct",
+    "anomaly_columns", "anomaly_buckets", "detail",
+]
+
+TIME_TZ_REGEX = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? UTC$"  # tz-explicit ts
+GRID_6H_REGEX = r" (?:00|06|12|18):00:00(?:\.0+)? UTC$"                 # 6h boundary
+WEI_LOOKING_MIN = 1e15        # a USD/ETH value this large => decimals never applied
+SENTINELS = (-1, 1e18, 999999999)   # magic values that must not leak into value fields
+MAGNITUDE_JUMP_DEX = 1.0      # |Δlog10| >= this between consecutive buckets = 10x break
+PRICE_SPREAD_TOL = 0.05       # cross-family implied-price spread tolerance (5%)
+
+
+# --------------------------------------------------------------------------- #
+# Tidy-result primitives (shared by every transformed-frame check)
+# --------------------------------------------------------------------------- #
+def _col_numbers(df, col):
+    """Row-aligned list of parsed numbers (None for null / non-numeric), decimals-safe."""
+    return [_to_number(v) for v in df[col]]
+
+
+def _key_buckets(df, mask, key="time_bucket", cap=10):
+    """(count, capped sample) of the key (or row index) where boolean mask is True."""
+    src = df[key] if key in df.columns else df.index
+    hits = [k for k, m in zip(src, mask) if m]
+    return len(hits), hits[:cap]
+
+
+def _t_record(tier, check, columns, n_checked, n_fail, severity="hard",
+              anomaly_columns="", anomaly_buckets=None, detail=""):
+    """Build one tidy result row (computes n_pass + pass_rate_pct)."""
+    n_checked, n_fail = int(n_checked), int(n_fail)
+    n_pass = n_checked - n_fail
+    buckets = anomaly_buckets or []
+    return {
+        "tier": tier, "check": check, "columns": columns, "severity": severity,
+        "n_checked": n_checked, "n_pass": n_pass, "n_fail": n_fail,
+        "pass_rate_pct": _pct(n_pass, n_checked),
+        "anomaly_columns": anomaly_columns,
+        "anomaly_buckets": "; ".join(str(b) for b in buckets),
+        "detail": detail,
+    }
+
+
+def _count_like_cols(df):
+    """Activity-count columns: *_count, unique_*, sampled_user_count."""
+    return [c for c in df.columns
+            if c.endswith("_count") or c.startswith("unique_") or c == "sampled_user_count"]
+
+
+def _value_cols(df):
+    """Valued amount columns: *_value_usd / *_value_eth."""
+    return [c for c in df.columns if c.endswith("_value_usd") or c.endswith("_value_eth")]
+
+
+def _avg_base_cols(df):
+    """User-account USD-base averages: avg_*_base."""
+    return [c for c in df.columns if c.startswith("avg_") and c.endswith("_base")]
+
+
+def _pair_le_num(df, a_col, b_col, cap=10):
+    """a <= b over rows where both present -> (n_checked, n_fail, sample buckets)."""
+    a, b = _col_numbers(df, a_col), _col_numbers(df, b_col)
+    mask = [(av is not None and bv is not None and av > bv) for av, bv in zip(a, b)]
+    n_checked = sum(1 for av, bv in zip(a, b) if av is not None and bv is not None)
+    _, sample = _key_buckets(df, mask, cap=cap)
+    return n_checked, sum(mask), sample
+
+
+def _monotonic_violations_num(df, asset_col, time_col, value_col):
+    """Per asset, value never decreases over time — decimals-aware (post RAY->decimal)."""
+    sub = df[[asset_col, time_col, value_col]].copy()
+    sub["_v"] = sub[value_col].map(_to_number)
+    sub = sub.sort_values([asset_col, time_col], kind="mergesort")  # time str sorts chronologically
+    n = bad = 0
+    prev_a = prev_v = None
+    for a, v in zip(sub[asset_col], sub["_v"]):
+        if v is not None and a == prev_a and prev_v is not None:
+            n += 1
+            if v < prev_v:
+                bad += 1
+        prev_a, prev_v = a, v
+    return n, bad
+
+
+# --------------------------------------------------------------------------- #
+# Consolidated scanners — one tidy row per logical check across many columns
+# (failures surface via anomaly_columns + per-offender counts in detail, so the
+# suite stays compact and a sub-100% pass rate is never buried in green noise).
+# --------------------------------------------------------------------------- #
+def _scan_values(df, cols, is_bad):
+    """Across cols, over non-null parsed values, count those failing is_bad(v).
+    Returns (n_checked, n_bad, {col: bad_count} for offending cols only)."""
+    n = bad = 0
+    off = {}
+    for c in cols:
+        cb = 0
+        for v in _col_numbers(df, c):
+            if v is None:
+                continue
+            n += 1
+            if is_bad(v):
+                bad += 1; cb += 1
+        if cb:
+            off[c] = cb
+    return n, bad, off
+
+
+def _scan_unparseable(df, cols):
+    """Across cols, count PRESENT cells that do not parse as a number."""
+    n = bad = 0
+    off = {}
+    for c in cols:
+        cb = 0
+        for v in df[c]:
+            if pd.isna(v):
+                continue
+            n += 1
+            if _to_number(v) is None:
+                bad += 1; cb += 1
+        if cb:
+            off[c] = cb
+    return n, bad, off
+
+
+def _scan_nulls(df, cols):
+    """Across cols, count null cells (a count/flow null = a quiet bucket left unfilled)."""
+    n = null = 0
+    off = {}
+    for c in cols:
+        cn = int(df[c].isna().sum())
+        n += len(df); null += cn
+        if cn:
+            off[c] = cn
+    return n, null, off
+
+
+def _scan_pairs_le(df, pairs):
+    """Each present (a, b): require a <= b. Returns (n_checked, n_bad, {label: bad})."""
+    n = bad = 0
+    off = {}
+    for a, b in pairs:
+        if a in df.columns and b in df.columns:
+            nn, bd, _ = _pair_le_num(df, a, b)
+            n += nn; bad += bd
+            if bd:
+                off[f"{a} <= {b}"] = bd
+    return n, bad, off
+
+
+def _offenders_str(off, unit=""):
+    """Human-readable 'col=count; col2=count2' for the detail field."""
+    return "; ".join(f"{k}={v}{unit}" for k, v in off.items())
+
+
+def _consolidated(tier, check, columns, n_checked, n_bad, off,
+                  severity="hard", detail=None):
+    """One tidy row for a multi-column check: anomaly_columns = the offenders."""
+    return _t_record(tier, check, columns, n_checked, n_bad, severity=severity,
+                     anomaly_columns=";".join(off),
+                     detail=detail if detail is not None else _offenders_str(off))
+
+
+# --------------------------------------------------------------------------- #
+# Tier 0 — Schema & type
+# --------------------------------------------------------------------------- #
+def tf_tier0_schema(df):
+    rows = []
+    if "time_bucket" in df.columns:                              # tz-explicit timestamp (UTC)
+        ok = df["time_bucket"].astype("string").str.match(TIME_TZ_REGEX, na=False)
+        _, sample = _key_buckets(df, (~ok).tolist())
+        rows.append(_t_record("T0", "time_bucket is a tz-explicit UTC timestamp",
+                              "time_bucket", len(df), int((~ok).sum()), anomaly_buckets=sample))
+
+    counts = _count_like_cols(df)
+    n, bad, off = _scan_values(df, counts, lambda v: float(v) != int(v))  # integer-valued
+    rows.append(_consolidated("T0", "counts are integer-valued (no fractional aggregation)",
+                              f"{len(counts)} count columns", n, bad, off))
+
+    # HARD: a quiet bucket must be a 0, not a missing row left over from a left-join.
+    # null count/flow cells are 'gaps' the transform never 0-filled (data_val.md Tier 4.5).
+    n, nul, off = _scan_nulls(df, counts)
+    rows.append(_consolidated("T0", "activity counts complete (quiet bucket = 0, not null)",
+                              f"{len(counts)} count columns", n, nul, off,
+                              detail="null cells per column (should be 0-filled): "
+                                     + (_offenders_str(off) or "none")))
+
+    vcols = (_value_cols(df) + _avg_base_cols(df)
+             + [c for c in ("avg_ltv", "avg_current_liquidation_threshold") if c in df.columns])
+    n, bad, off = _scan_unparseable(df, vcols)                  # numeric float, not junk string
+    rows.append(_consolidated("T0", "value / avg columns parse as a numeric float",
+                              f"{len(vcols)} value/avg columns", n, bad, off))
+    return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1 — Univariate domain / range
+# --------------------------------------------------------------------------- #
+def tf_tier1_domain(df):
+    rows = []
+    nn = _count_like_cols(df) + _value_cols(df) + _avg_base_cols(df)
+    n, bad, off = _scan_values(df, nn, lambda v: v < 0)         # non-negativity (one scan)
+    rows.append(_consolidated("T1", "non-negative (>= 0): counts, *_value_*, avg_*_base",
+                              f"{len(nn)} columns", n, bad, off))
+
+    bps = [c for c in ("avg_ltv", "avg_current_liquidation_threshold") if c in df.columns]
+    n, bad, off = _scan_values(df, bps, lambda v: v < 0 or v > BPS_MAX)   # numeric bound
+    rows.append(_consolidated("T1", "bps numeric bound [0, 10000]",
+                              "avg_ltv, avg_current_liquidation_threshold", n, bad, off))
+
+    # HARD: bps fields must be on the bps SCALE. A populated value in (0, 1] is the silent
+    # bps->fraction conversion data_val.md says to catch — it slips past the [0, 10000] bound
+    # only because 0.79 < 10000. Count every fractional value as a unit violation.
+    n, bad, off = _scan_values(df, bps, lambda v: 0 < v <= 1.0)
+    rows.append(_consolidated("T1", "bps fields on bps scale (not silently rescaled to fraction)",
+                              "avg_ltv, avg_current_liquidation_threshold", n, bad, off,
+                              detail="fractional (0,1] values per column — spec expects bps 0-10000: "
+                                     + (_offenders_str(off) or "none")))
+
+    sv = _value_cols(df) + _avg_base_cols(df)
+    n, bad, off = _scan_values(df, sv, lambda v: v in SENTINELS or abs(v) >= WEI_LOOKING_MIN)
+    rows.append(_consolidated("T1", "no sentinel / un-scaled wei magnitude in value fields",
+                              f"{len(sv)} value/base columns", n, bad, off,
+                              detail=f"flags {SENTINELS} or |v|>={WEI_LOOKING_MIN:g}; offenders: "
+                                     + (_offenders_str(off) or "none")))
+    return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2 — Intra-row logical invariants
+# --------------------------------------------------------------------------- #
+def _zero_coupling(df, anchor, amount_members, count_members, cap=10):
+    """count <=> amount <=> uniques per family.  Per row with the anchor present:
+         anchor == 0  =>  every member == 0
+         anchor  > 0  =>  every amount & unique member > 0
+    All-null rows (anchor and members all null) are NOT counted — they are the
+    'quiet bucket vs pipeline gap' case and are reported separately so a structural
+    zero is never confused with a missing row.
+    """
+    members = amount_members + count_members
+    a = _col_numbers(df, anchor)
+    M = {m: _col_numbers(df, m) for m in members}
+    n_checked = n_fail = n_null = n_zero = n_active = 0
+    mask = [False] * len(df)
+    for i in range(len(df)):
+        av = a[i]
+        mv = [M[m][i] for m in members]
+        if av is None and all(v is None for v in mv):
+            n_null += 1                                          # all-null: quiet or gap
+            continue
+        n_checked += 1                                           # any non-all-null row is checked
+        if av is None:                                           # anchor null but members present
+            n_fail += 1; mask[i] = True
+            continue
+        if av == 0:
+            if all(v == 0 for v in mv):
+                n_zero += 1
+            else:
+                n_fail += 1; mask[i] = True
+        else:
+            n_active += 1
+            ok = (all(M[m][i] is not None and M[m][i] > 0 for m in amount_members)
+                  and all(M[m][i] is not None and M[m][i] > 0 for m in count_members))
+            if not ok:
+                n_fail += 1; mask[i] = True
+    _, sample = _key_buckets(df, mask, cap=cap)
+    return n_checked, n_fail, sample, n_null, n_zero, n_active
+
+
+def _sampling_consistency(df, cap=10):
+    """sampled_user_count == 0  =>  the avg_* aggregates must be null (not a 0 from /0).
+    One consolidated row; offenders = avg_* columns that held a value at a zero-sample row."""
+    if "sampled_user_count" not in df.columns:
+        return []
+    s = _col_numbers(df, "sampled_user_count")
+    zero_idx = [i for i, v in enumerate(s) if v is not None and v == 0]
+    targets = [c for c in ("avg_total_collateral_base", "avg_total_debt_base",
+                           "avg_available_borrows_base", "avg_ltv",
+                           "avg_current_liquidation_threshold") if c in df.columns]
+    mask = [False] * len(df)
+    off = {}
+    for c in targets:
+        cn = _col_numbers(df, c)
+        cb = 0
+        for i in zero_idx:
+            if cn[i] is not None:                                # present where it should be null
+                mask[i] = True; cb += 1
+        if cb:
+            off[c] = cb
+    _, sample = _key_buckets(df, mask, cap=cap)
+    note = f"rows with sampled_user_count==0: {len(zero_idx)}"
+    if not zero_idx:
+        note += " (invariant not exercised on this data)"
+    return [_t_record("T2", "sampled_user_count==0 => avgs are null (no /0 masquerading as 0)",
+                      f"{len(targets)} avg_* columns", len(zero_idx) * len(targets),
+                      sum(off.values()), anomaly_columns=";".join(off),
+                      anomaly_buckets=sample, detail=note)]
+
+
+def tf_tier2_invariants(df):
+    rows = []
+    uniq_pairs = [("unique_suppliers", "supply_tx_count"),
+                  ("unique_withdraw_users", "withdrawal_tx_count"),
+                  ("unique_borrowers", "borrow_tx_count"),
+                  ("unique_repayers", "repay_tx_count"),
+                  ("unique_liquidated_users", "liquidation_tx_count"),
+                  ("unique_liquidators", "liquidation_tx_count"),
+                  ("unique_flashloan_initiators", "flashloan_tx_count"),
+                  ("unique_collateral_enable_users", "collateral_enabled_count"),
+                  ("unique_collateral_disable_users", "collateral_disabled_count")]
+    n, bad, off = _scan_pairs_le(df, uniq_pairs)               # uniques <= tx (all families)
+    rows.append(_consolidated("T2", "unique users <= tx count (all families)",
+                              "9 unique/tx family pairs", n, bad, off))
+    subset_pairs = [("variable_borrow_tx_count", "borrow_tx_count"),
+                    ("variable_flashloan_tx_count", "flashloan_tx_count"),
+                    ("no_open_debt_flashloan_tx_count", "flashloan_tx_count")]
+    n, bad, off = _scan_pairs_le(df, subset_pairs)             # mode partitions <= total
+    rows.append(_consolidated("T2", "subset count <= total (mode partitions)",
+                              "3 subset pairs", n, bad, off))
+    families = [
+        ("supply", "supply_tx_count",
+         ["supply_amount_value_usd", "supply_amount_value_eth"], ["unique_suppliers"]),
+        ("withdrawal", "withdrawal_tx_count",
+         ["withdrawal_amount_value_usd", "withdrawal_amount_value_eth"], ["unique_withdraw_users"]),
+        ("borrow", "borrow_tx_count",
+         ["borrow_amount_value_usd", "borrow_amount_value_eth"], ["unique_borrowers"]),
+        ("repay", "repay_tx_count",
+         ["repay_amount_value_usd", "repay_amount_value_eth"], ["unique_repayers"]),
+        ("liquidation", "liquidation_tx_count",
+         ["liquidated_collateral_value_usd", "liquidated_collateral_value_eth",
+          "liquidation_debt_covered_value_usd", "liquidation_debt_covered_value_eth"],
+         ["unique_liquidated_users", "unique_liquidators"]),
+        ("flashloan", "flashloan_tx_count",
+         ["flashloan_amount_value_usd", "flashloan_amount_value_eth"],
+         ["unique_flashloan_initiators"]),
+    ]
+    for name, anchor, amts, cnts in families:
+        if anchor in df.columns and all(c in df.columns for c in amts + cnts):
+            n, bad, sample, n_null, n_zero, n_active = _zero_coupling(df, anchor, amts, cnts)
+            rows.append(_t_record("T2", f"{name}: zero-coupling (count<=>amount<=>uniques)",
+                                  anchor, n, bad,
+                                  anomaly_columns=(",".join([anchor] + amts + cnts) if bad else ""),
+                                  anomaly_buckets=sample,
+                                  detail=f"all_null(quiet/gap)={n_null} structural_zero={n_zero} "
+                                         f"active={n_active}"))
+    if {"liquidation_debt_covered_value_usd", "liquidated_collateral_value_usd"} <= set(df.columns):
+        n, bad, sample = _pair_le_num(df, "liquidation_debt_covered_value_usd",
+                                      "liquidated_collateral_value_usd")
+        rows.append(_t_record("T2", "liquidated collateral >= debt covered (USD; bonus)",
+                              "debt_covered <= collateral (usd)", n, bad, severity="soft",
+                              anomaly_buckets=sample))
+    if {"avg_ltv", "avg_current_liquidation_threshold"} <= set(df.columns):
+        n, bad, sample = _pair_le_num(df, "avg_ltv", "avg_current_liquidation_threshold")
+        rows.append(_t_record("T2", "avg_ltv <= avg_current_liquidation_threshold",
+                              "avg_ltv <= avg_current_liquidation_threshold", n, bad,
+                              anomaly_columns=("avg_ltv,avg_current_liquidation_threshold" if bad else ""),
+                              anomaly_buckets=sample))
+    if {"avg_total_debt_base", "avg_total_collateral_base"} <= set(df.columns):
+        n, bad, sample = _pair_le_num(df, "avg_total_debt_base", "avg_total_collateral_base")
+        rows.append(_t_record("T2", "avg_total_debt_base <= avg_total_collateral_base (overcollat)",
+                              "debt_base <= collateral_base", n, bad, severity="soft",
+                              anomaly_buckets=sample))
+    if "sampled_user_count" in df.columns:                     # SOFT: avg_* reliability
+        n, bad, off = _scan_values(df, ["sampled_user_count"], lambda v: v < 2)
+        rows.append(_t_record("T2", "avg_* backed by >= 2 sampled users (not a single-user proxy)",
+                              "sampled_user_count", n, bad, severity="soft",
+                              anomaly_columns=";".join(off),
+                              detail="buckets where sampled_user_count==1 make every avg_* a single "
+                                     "user's value, not a market average — unreliable as a feature"))
+    rows.extend(_sampling_consistency(df))
+    return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+
+
+# --------------------------------------------------------------------------- #
+# Tier 3 — Unit & cross-asset consistency
+# --------------------------------------------------------------------------- #
+def _usd_eth_pairing(df, usd, eth, cap=10):
+    """usd == 0 (or null) <=> eth == 0 (or null), over rows where either side is present."""
+    u, e = _col_numbers(df, usd), _col_numbers(df, eth)
+    mask, n_checked = [], 0
+    for uv, ev in zip(u, e):
+        if uv is None and ev is None:
+            mask.append(False); continue
+        n_checked += 1
+        mask.append(((uv is None or uv == 0)) != ((ev is None or ev == 0)))
+    _, sample = _key_buckets(df, mask, cap=cap)
+    return n_checked, sum(mask), sample
+
+
+def _implied_price_coherence(df, families, tol=PRICE_SPREAD_TOL, cap=10):
+    """Per bucket, usd/eth across families should imply ~one ETH price (spread <= tol)."""
+    cols = {f: (_col_numbers(df, f[0]), _col_numbers(df, f[1])) for f in families}
+    mask = [False] * len(df)
+    spreads = []
+    for i in range(len(df)):
+        prices = []
+        for f in families:
+            uv, ev = cols[f][0][i], cols[f][1][i]
+            if uv is not None and ev is not None and uv > 0 and ev > 0:
+                prices.append(uv / ev)
+        if len(prices) >= 2:
+            med = sorted(prices)[len(prices) // 2]
+            spread = (max(prices) - min(prices)) / med if med else 0.0
+            spreads.append(spread)
+            if spread > tol:
+                mask[i] = True
+    n_checked = len(spreads)
+    _, sample = _key_buckets(df, mask, cap=cap)
+    ss = sorted(spreads)
+    detail = (f"median_spread={ss[len(ss)//2]:.4f} p95={ss[int(0.95*(len(ss)-1))]:.4f} "
+              f"max={max(spreads):.4f}" if spreads else "no comparable buckets")
+    return n_checked, sum(mask), sample, detail
+
+
+def _magnitude_stability(df, cols, dex=MAGNITUDE_JUMP_DEX, cap=10):
+    """avg_*_base base-unit stability. A decimals / base-unit change is a *persistent*
+    mid-series level shift, not bucket-to-bucket noise — and these averages legitimately
+    swing orders of magnitude on their own because the per-bucket sample is tiny. So this is
+    a series-level check: compare the median log10 of the first vs second half of the
+    time-ordered series and flag only a sustained shift of >= dex orders (one soft check per
+    column). The old per-bucket jump count fired on ordinary sampling variation (~50% FPs)."""
+    import statistics
+    recs = []
+    for c in cols:
+        logs = [math.log10(x) for x in _col_numbers(df, c) if x is not None and x > 0]
+        if len(logs) < 4:                                       # too few points to judge a break
+            recs.append(_t_record("T3", "avg_*_base magnitude stable (no 10^x base-unit break)",
+                                  c, 0, 0, severity="soft", detail="insufficient positive values"))
+            continue
+        half = len(logs) // 2
+        m1, m2 = statistics.median(logs[:half]), statistics.median(logs[half:])
+        broke = abs(m2 - m1) >= dex
+        recs.append(_t_record("T3", "avg_*_base magnitude stable (no 10^x base-unit break)",
+                              c, 1, 1 if broke else 0, severity="soft",
+                              anomaly_columns=(c if broke else ""),
+                              detail=f"median log10 1st-half={m1:.2f} 2nd-half={m2:.2f} "
+                                     f"(Δ={m2 - m1:+.2f} dex); range=[{min(logs):.2f}, {max(logs):.2f}]"))
+    return recs
+
+
+def tf_tier3_consistency(df):
+    rows = []
+    pairs = [("supply_amount_value_usd", "supply_amount_value_eth"),
+             ("withdrawal_amount_value_usd", "withdrawal_amount_value_eth"),
+             ("borrow_amount_value_usd", "borrow_amount_value_eth"),
+             ("repay_amount_value_usd", "repay_amount_value_eth"),
+             ("liquidated_collateral_value_usd", "liquidated_collateral_value_eth"),
+             ("liquidation_debt_covered_value_usd", "liquidation_debt_covered_value_eth"),
+             ("flashloan_amount_value_usd", "flashloan_amount_value_eth"),
+             ("flashloan_premium_value_usd", "flashloan_premium_value_eth")]
+    n = bad = 0
+    off = {}
+    for u, e in pairs:                                         # USD<=>ETH nullity (one scan)
+        if u in df.columns and e in df.columns:
+            nn, bd, _ = _usd_eth_pairing(df, u, e)
+            n += nn; bad += bd
+            if bd:
+                off[f"{u}~{e}"] = bd
+    rows.append(_consolidated("T3", "USD<=>ETH paired nullity (0/empty together)",
+                              f"{len(pairs)} value pairs", n, bad, off))
+    fams = [(u, e) for u, e in pairs[:7]                       # amount pairs (skip premium)
+            if u in df.columns and e in df.columns and "premium" not in u]
+    if len(fams) >= 2:
+        n, bad, sample, detail = _implied_price_coherence(df, fams)
+        rows.append(_t_record("T3", "cross-family implied ETH price coherent (<= 5% spread)",
+                              "usd/eth across families", n, bad, severity="soft",
+                              anomaly_buckets=sample, detail=detail))
+    rows.extend(_magnitude_stability(df, _avg_base_cols(df)))
+    return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+
+
+# --------------------------------------------------------------------------- #
+# Tier 4 — Temporal integrity (time_bucket as the protocol-level primary key)
+# --------------------------------------------------------------------------- #
+def _full_6h_grid(start, end):
+    """Every 6h boundary from start to end inclusive (as pandas Timestamps)."""
+    from datetime import timedelta
+    step, t, grid = timedelta(hours=6), start, []
+    while t <= end:
+        grid.append(t); t += step
+    return grid
+
+
+def tf_tier4_temporal(df):
+    rows = []
+    if "time_bucket" not in df.columns:
+        return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+    s = df["time_bucket"].astype("string")
+    parsed = pd.to_datetime(s.str.replace(" UTC", "", regex=False), errors="coerce", utc=True)
+
+    dup = df["time_bucket"].duplicated(keep=False).tolist()    # PK uniqueness
+    _, dup_sample = _key_buckets(df, dup)
+    rows.append(_t_record("T4", "time_bucket unique (no duplicate PK)", "time_bucket",
+                          len(df), sum(dup), anomaly_buckets=dup_sample,
+                          detail=f"distinct={df['time_bucket'].nunique()} of {len(df)} rows"))
+
+    grid_bad = [bool(pd.isna(p)) or (p.hour not in (0, 6, 12, 18) or p.minute or p.second)
+                for p in parsed]                                # 6h grid alignment
+    _, g_sample = _key_buckets(df, grid_bad)
+    rows.append(_t_record("T4", "time_bucket lands on a 6h boundary (00/06/12/18 UTC)",
+                          "time_bucket", len(df), sum(grid_bad), anomaly_buckets=g_sample))
+
+    valid = sorted(p for p in parsed if not pd.isna(p))
+    if valid:
+        grid = _full_6h_grid(valid[0], valid[-1])               # gaps / coverage
+        present = set(valid)
+        missing = [g for g in grid if g not in present]
+        rows.append(_t_record("T4", "no gaps: full 6h coverage over min..max range",
+                              "time_bucket", len(grid), len(missing),
+                              anomaly_buckets=[g.strftime("%Y-%m-%d %H:%M UTC") for g in missing[:10]],
+                              detail=f"expected={len(grid)} present={len(present)} "
+                                     f"missing={len(missing)} "
+                                     f"range=[{valid[0]:%Y-%m-%d %H:%M} .. {valid[-1]:%Y-%m-%d %H:%M}]"))
+        pv = parsed.tolist()                                    # strictly increasing in row order
+        n_tr = sum(1 for i in range(len(pv) - 1)
+                   if not pd.isna(pv[i]) and not pd.isna(pv[i + 1]))
+        n_bad = sum(1 for i in range(len(pv) - 1)
+                    if not pd.isna(pv[i]) and not pd.isna(pv[i + 1]) and pv[i + 1] <= pv[i])
+        rows.append(_t_record("T4", "time_bucket strictly increasing in row order",
+                              "time_bucket", n_tr, n_bad))
+    return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+
+
+# --------------------------------------------------------------------------- #
+# Entry points — run all tiers and (optionally) save one tidy CSV per frame
+# --------------------------------------------------------------------------- #
+def validate_transformed_final(df, table_name="DF_common_final",
+                               results_dir="validation_results", save=True):
+    """Run Tiers 0-4 on the protocol-level feature matrix; return one tidy DataFrame."""
+    out = pd.concat([tf_tier0_schema(df), tf_tier1_domain(df), tf_tier2_invariants(df),
+                     tf_tier3_consistency(df), tf_tier4_temporal(df)], ignore_index=True)
+    if save:
+        from pathlib import Path
+        folder = Path(results_dir); folder.mkdir(parents=True, exist_ok=True)
+        out.to_csv(folder / f"{table_name}__transform_validation.csv", index=False)
+    return out
+
+
+def validate_reserve_panel(df, table_name="DF_common_1",
+                           results_dir="validation_results", save=True):
+    """Applicable subset of data_val.md for the asset-level reserve panel
+    (composite-PK uniqueness, time schema/grid, rate/index non-negativity, index>=1.0
+    and per-asset index monotonicity). Returns one tidy DataFrame."""
+    rows = []
+    if {"time_bucket", "asset"} <= set(df.columns):
+        dup = df.duplicated(subset=["time_bucket", "asset"], keep=False).tolist()
+        _, sample = _key_buckets(df, dup, key="asset")
+        n_keys = df.drop_duplicates(["time_bucket", "asset"]).shape[0]
+        rows.append(_t_record("T0/T4", "composite PK (time_bucket, asset) unique",
+                              "time_bucket,asset", len(df), sum(dup), anomaly_buckets=sample,
+                              detail=f"distinct keys={n_keys} of {len(df)} rows"))
+    if "time_bucket" in df.columns:
+        s = df["time_bucket"].astype("string")
+        ok = s.str.match(TIME_TZ_REGEX, na=False)
+        rows.append(_t_record("T0", "time_bucket is a tz-explicit UTC timestamp",
+                              "time_bucket", len(df), int((~ok).sum())))
+        grid = s.str.contains(GRID_6H_REGEX, regex=True, na=False)
+        rows.append(_t_record("T4", "time_bucket lands on a 6h boundary",
+                              "time_bucket", len(df), int((~grid).sum())))
+    for c in ("last_borrow_rate", "liquidity_rate", "variable_borrow_rate"):
+        if c in df.columns:
+            r = negative_value_check(df, c, plot=False)
+            rows.append(_t_record("T1", "rate >= 0 (RAY->decimal)", c,
+                                  r["n_checked"], r["n_negative"],
+                                  anomaly_columns=(c if r["n_negative"] else ""),
+                                  detail=f"observed_min={r['min_value']}"))
+    for c in ("liquidity_index", "variable_borrow_index"):
+        if c in df.columns:
+            r = range_check(df, c, min_value=1.0, plot=False)
+            rows.append(_t_record("T1", "index >= 1.0 (RAY->decimal)", c,
+                                  r["n_checked"], r["n_below_min"],
+                                  anomaly_columns=(c if r["n_below_min"] else ""),
+                                  detail=f"observed_min={r['observed_min']}"))
+            if {"asset", "time_bucket"} <= set(df.columns):
+                n, bad = _monotonic_violations_num(df, "asset", "time_bucket", c)
+                rows.append(_t_record("T2", "index non-decreasing per asset over time", c,
+                                      n, bad, anomaly_columns=(c if bad else "")))
+    out = pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
+    if save:
+        from pathlib import Path
+        folder = Path(results_dir); folder.mkdir(parents=True, exist_ok=True)
+        out.to_csv(folder / f"{table_name}__transform_validation.csv", index=False)
     return out
 
 
