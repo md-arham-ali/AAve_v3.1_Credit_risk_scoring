@@ -578,7 +578,7 @@ def validate_table_advanced(df, table_name=None, results_dir="validation_results
     name = table_name or detect_table(df) or "unknown"
     prepared = prepare(df)
 
-    import great_expectations as ge                     # lazy: only needed here
+    import great_expectations as ge                    # lazy: only needed here, gx installed in second venv, venv-ge
     gdf = ge.from_pandas(prepared)
 
     chk = Checks(gdf, name, df)
