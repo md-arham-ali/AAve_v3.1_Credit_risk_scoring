@@ -33,8 +33,8 @@ WITH events AS (
         borrowRate                    AS borrow_rate,
         'borrow'                      AS kind
     FROM aave_v3_ethereum.pool_evt_borrow
-    WHERE evt_block_date >= DATE '2025-11-01'
-      AND evt_block_date <  DATE '2026-02-01'
+    WHERE evt_block_date >= DATE '2025-04-01'
+      AND evt_block_date <  DATE '2026-03-31'
 
     UNION ALL
 
@@ -49,29 +49,25 @@ WITH events AS (
         CAST(NULL AS uint256)         AS borrow_rate,
         'repay'                       AS kind
     FROM aave_v3_ethereum.pool_evt_repay
-    WHERE evt_block_date >= DATE '2025-11-01'
-      AND evt_block_date <  DATE '2026-02-01'
+    WHERE evt_block_date >= DATE '2025-04-01'
+      AND evt_block_date <  DATE '2026-03-31'
 ),
 agg AS (
     SELECT
         date_add('hour',
-                 6 * CAST(floor(hour(evt_block_time) / 6) AS bigint),
+                 2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
                  date_trunc('day', evt_block_time))                            AS time_bucket,
         asset,
-        -- cumulative raw flows in the bucket
         SUM(CASE WHEN kind = 'borrow' THEN amount END)                         AS borrow_amount_raw,
         SUM(CASE WHEN kind = 'repay'  THEN amount END)                         AS repay_amount_raw,
-        -- signed net debt flow: borrow (+), repayment (-)
         SUM(CASE WHEN kind = 'borrow' THEN  CAST(amount AS int256)
                  WHEN kind = 'repay'  THEN -CAST(amount AS int256) END)        AS net_debt_flow_raw,
-        -- activity counts
         COUNT(CASE WHEN kind = 'borrow' THEN 1 END)                            AS borrow_tx_count,
         COUNT(CASE WHEN kind = 'repay'  THEN 1 END)                            AS repay_tx_count,
         COUNT(CASE WHEN kind = 'borrow' AND irm = 1 THEN 1 END)                AS stable_borrow_tx_count,
         COUNT(CASE WHEN kind = 'borrow' AND irm = 2 THEN 1 END)                AS variable_borrow_tx_count,
         approx_distinct(CASE WHEN kind = 'borrow' THEN actor END)              AS unique_borrowers,
         approx_distinct(CASE WHEN kind = 'repay'  THEN actor END)              AS unique_repayers,
-        -- end-of-period borrow rate (last borrow event in the bucket)
         max_by(borrow_rate,
                CASE WHEN kind = 'borrow' THEN ROW(evt_block_number, evt_index) END)
                                                                                AS last_borrow_rate,
@@ -83,10 +79,10 @@ agg AS (
 SELECT
     agg.time_bucket,
     agg.asset,
-    tok.symbol                                                                AS asset_symbol,
-    agg.borrow_amount_raw,
-    agg.repay_amount_raw,
-    agg.net_debt_flow_raw,
+    tok.symbol                                                                 AS asset_symbol,
+    agg.borrow_amount_raw                                                      AS borrow_amount,
+    agg.repay_amount_raw                                                       AS repay_amount,
+    agg.net_debt_flow_raw                                                      AS net_debt_flow,
     agg.borrow_tx_count,
     agg.repay_tx_count,
     agg.stable_borrow_tx_count,

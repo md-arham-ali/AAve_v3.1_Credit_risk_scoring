@@ -23,7 +23,7 @@
 WITH agg AS (
     SELECT
         date_add('hour',
-                 6 * CAST(floor(hour(call_block_time) / 6) AS bigint),
+                 1 * CAST(floor(hour(call_block_time) / 1) AS bigint),
                  date_trunc('day', call_block_time))                               AS time_bucket,
         asset,
         max_by(output_0, ROW(call_block_number, call_tx_index))                   AS oracle_asset_price,

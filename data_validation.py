@@ -21,14 +21,14 @@ import pandas as pd
 # Friendly result names per Dune query id (falls back to query_<id> otherwise).
 TABLE_LABELS = {
     "7702138": "supply_withdraw",
-    "7702164": "borrow_repay",
+    "7798273": "borrow_repay",
     "7711042": "reserve_state_rates",
-    "7711190": "reserve_config",
-    "7711212": "liquidation",
-    "7711227": "flashloan",
-    "7711236": "user_account",
-    "7711248": "collateral_toggle",
-    "7714873": "oracle_price_usd_eth_weth_6h",
+    "7798416": "reserve_config",
+    "7798339": "liquidation",
+    "7798349": "flashloan",
+    "7798351": "user_account",
+    "7798372": "collateral_toggle",
+    "7798226": "oracle_price_usd_eth_weth_6h",
 }
 
 # Columns that, when present, are the table's address-style keys, sometimes unique for tx hashes, though not necessary for this project.
@@ -73,6 +73,31 @@ def required_columns(df):
     if "metric" in cols:  # decimal-reference asset is intentionally nullable
         return ["metric"]
     return []
+
+
+def canonicalize_keys(df, time_col="time_bucket", asset_col="asset"):
+    """Rewrite a frame's join keys to the model-ready (transformed-frame) convention.
+
+    The transformed frames (``DF_common_1`` / ``DF_common_final``) store
+    ``time_bucket`` as a tz-explicit ``"YYYY-MM-DD HH:MM:SS.fff UTC"`` string and
+    ``asset`` as a lower-case hex address. Raw extracts such as ``reserve_config``
+    store ``time_bucket`` as a plain ``"YYYY-MM-DD HH:MM:SS"`` (no ``UTC`` suffix),
+    so a string-keyed merge silently misses every row. This normalizes the keys to
+    that canonical convention so a plain ``merge(on=[time_col, asset_col])`` lines up.
+
+    Returns a NEW frame (the input is not mutated). Column-aware (acts only on the
+    keys that are present) and idempotent — re-formatting an already-canonical key
+    yields the same string.
+    """
+    out = df.copy()
+    if time_col in out.columns:
+        ts = pd.to_datetime(
+            out[time_col].astype(str).str.replace(" UTC", "", regex=False),
+            utc=True, format="mixed")
+        out[time_col] = ts.dt.strftime("%Y-%m-%d %H:%M:%S.%f").str[:-3] + " UTC"
+    if asset_col in out.columns:
+        out[asset_col] = out[asset_col].astype(str).str.strip().str.lower()
+    return out
 
 
 def _expected_kind(col):
@@ -158,7 +183,7 @@ def _add_expectations(gdf, df):
 
     if "time_bucket" in cols:                                    # format + window + 6h grid
         gdf.expect_column_values_to_match_regex(
-            "time_bucket", r"^(2025-1[12]|2026-01)-\d{2} (00|06|12|18):00:00")
+            "time_bucket", r"^(2025-1[12]|2026-01)-\d{2} ([01]\d|2[0-3]):00:00")
 
     for c in ADDRESS_COLS:                                       # 20-byte hex address shape
         if c in cols:

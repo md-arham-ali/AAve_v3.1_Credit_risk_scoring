@@ -26,8 +26,9 @@ from data_validation import TABLE_LABELS, table_name_from_path
 # Folder holding the raw, versioned extracts. Read-only from this stage.
 SOURCE_DIR = "query_result_data"
 
-# Matches query_result_data_<query_id>_<YYYYMMDDTHHMMSSZ>.csv
-_NAME_RE = re.compile(r"query_result_data_(\d+)_(\d{8}T\d{6}Z)$")
+# Matches the versioned suffix _<query_id>_<YYYYMMDDTHHMMSSZ> at the end of the stem —
+# works for both query_result_data_<id>_<ts>.csv and <table_name>_<id>_<ts>.csv.
+_NAME_RE = re.compile(r"_(\d+)_(\d{8}T\d{6}Z)$")
 
 
 def _parse_name(path):
@@ -45,7 +46,7 @@ def latest_paths(source_dir=SOURCE_DIR):
     max string per query id is the most recent fetch.
     """
     newest = {}  # query_id -> (timestamp, path)
-    for path in Path(source_dir).glob("query_result_data_*.csv"):
+    for path in Path(source_dir).glob("*.csv"):
         qid, stamp = _parse_name(path)
         if qid is None:
             continue
@@ -136,6 +137,17 @@ def _scaled_name(col, suffix):
     return f"{col}{suffix}"
 
 
+def _scale_value(value, dec):
+    """Divide one value by ``10**dec`` exactly (Decimal -> float).
+
+    Returns NaN when either the value or its decimals is missing, so scaling only
+    happens when both are present. The big integer stays exact until the final cast.
+    """
+    if pd.isna(value) or pd.isna(dec):
+        return float("nan")
+    return float(Decimal(str(value)) / (Decimal(10) ** int(dec)))
+
+
 def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
                       decimals_col="decimals", drop_raw=False, suffix="_scaled"):
     """Divide raw integer-amount columns by ``10**decimals`` -> real token units.
@@ -176,15 +188,79 @@ def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
 
     decs = list(dec_per_row)
     for col in cols:
-        raws = list(df[col])
-        scaled = [
-            float(Decimal(str(raw)) / (Decimal(10) ** int(dec)))
-            if not (pd.isna(raw) or pd.isna(dec)) else float("nan")
-            for raw, dec in zip(raws, decs)
+        out[_scaled_name(col, suffix)] = [
+            _scale_value(raw, dec) for raw, dec in zip(df[col], decs)
         ]
-        out[_scaled_name(col, suffix)] = scaled
 
     if drop_raw:
+        out = out.drop(columns=[c for c in cols if c in out.columns])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Per-COLUMN scaling: scale whole columns by a fixed decimals from a metric map
+# --------------------------------------------------------------------------- #
+# Companion to scale_by_decimals (per-ASSET, ``_raw`` columns). Some metrics carry a
+# FIXED decimals that is the same for every row of the column rather than per-asset
+# (e.g. Aave config metrics: supply_cap/borrow_cap -> 0, debt_ceiling -> 2, the bps
+# fields -> 4). Their decimals live in a reference table keyed by ``metric`` (the
+# column name) + ``decimals``; this scales each matched column by ``10**decimals``.
+
+def column_decimals_map(decimals, metric_col="metric", decimals_col="decimals"):
+    """Normalize a per-column decimals argument into a ``{column_name: int}`` lookup.
+
+    Accepts:
+      * ``dict`` / ``pd.Series`` -> used directly (index/keys are column names),
+      * ``pd.DataFrame``         -> built from its ``metric`` + ``decimals`` columns
+        (``metric`` holds the column name). Rows with a null metric or null decimals
+        are dropped; duplicate metrics keep the first row.
+    """
+    if isinstance(decimals, pd.Series):
+        return decimals.dropna().astype(int).to_dict()
+    if isinstance(decimals, pd.DataFrame):
+        ref = decimals.dropna(subset=[metric_col, decimals_col]).drop_duplicates(metric_col)
+        return dict(zip(ref[metric_col], ref[decimals_col].astype(int)))
+    return dict(decimals)
+
+
+def scale_columns_by_decimals(df, decimals, columns=None, metric_col="metric",
+                              decimals_col="decimals", overwrite=False,
+                              drop_original=False, suffix="_scaled"):
+    """Divide whole columns by ``10**decimals``, with a FIXED decimals PER COLUMN.
+
+    Returns a NEW DataFrame (the input is not mutated). For each scaled column the
+    value is divided by ``10**decimals`` only when both the value and its decimals are
+    present; otherwise the result is NaN (same rule as :func:`scale_by_decimals`).
+
+    Parameters
+    ----------
+    decimals : dict | pd.Series | pd.DataFrame
+        Per-column decimals; see :func:`column_decimals_map`. A DataFrame is read from
+        its ``metric_col`` (column name) and ``decimals_col``.
+    columns : list[str] | None
+        Columns to scale. Defaults to every ``df`` column found in the decimals map.
+    overwrite : bool
+        Write the scaled values back onto the source column. Otherwise a new
+        ``<col><suffix>`` column is added.
+    drop_original : bool
+        Drop the source columns after scaling (ignored when ``overwrite`` is True).
+    suffix : str
+        Suffix for the scaled column when ``overwrite`` is False.
+    """
+    dmap = column_decimals_map(decimals, metric_col=metric_col, decimals_col=decimals_col)
+    cols = [c for c in (columns if columns is not None else df.columns)
+            if c in dmap and c in df.columns]
+    if not cols:
+        return df.copy()
+
+    out = df.copy()
+    for col in cols:
+        dec = dmap[col]
+        out[col if overwrite else f"{col}{suffix}"] = [
+            _scale_value(v, dec) for v in df[col]
+        ]
+
+    if drop_original and not overwrite:
         out = out.drop(columns=[c for c in cols if c in out.columns])
     return out
 
@@ -199,9 +275,11 @@ def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
 # The two frames store time_bucket in different string formats
 # ("2025-11-01 00:00:00.000 UTC" vs "2025-11-01 00:00:00"), so both are normalized
 # to a UTC datetime key before matching. Each amount column gets two new value
-# columns: amount * USD price and amount * ETH price. A missing price (the asset/time
-# is absent from the price table, or the price is null) or a missing amount counts
-# as 0, so the resulting value is 0 rather than NaN.
+# columns: amount * USD price and amount * ETH price. The multiplication happens
+# only when BOTH operands are present; a missing price (the asset/time is absent
+# from the price table, or the price is null) or a missing amount yields NaN, so
+# rows with no oracle price (e.g. dates the price table doesn't cover) are left
+# blank rather than silently valued at 0.
 
 def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
                       asset_col="asset", usd_col="avg_price_usd",
@@ -217,7 +295,8 @@ def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
 
     Rows are matched on (``time_col``, ``asset_col``). The two frames may store
     ``time_col`` in different string formats, so it is normalized to a UTC datetime
-    key on both sides. Any missing price or amount is treated as 0.
+    key on both sides. The product is computed only when both the amount and the
+    matched price are present; if either is missing the result is NaN (not 0).
 
     Parameters
     ----------
@@ -234,22 +313,22 @@ def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
     left_key = pd.to_datetime(df[time_col], utc=True, format="mixed")
     right_key = pd.to_datetime(prices[time_col], utc=True, format="mixed")
 
-    # one price row per (time, asset): usd + eth, with null prices -> 0
+    # one price row per (time, asset): usd + eth, null prices stay NaN
     price = pd.DataFrame({
         "_t": right_key,
         "_a": prices[asset_col],
-        "_usd": pd.to_numeric(prices[usd_col], errors="coerce").fillna(0.0),
-        "_eth": pd.to_numeric(prices[eth_col], errors="coerce").fillna(0.0),
+        "_usd": pd.to_numeric(prices[usd_col], errors="coerce"),
+        "_eth": pd.to_numeric(prices[eth_col], errors="coerce"),
     }).drop_duplicates(["_t", "_a"])
 
-    # left-join keeps df's row order; an unmatched (time, asset) -> 0 price
+    # left-join keeps df's row order; an unmatched (time, asset) -> NaN price
     merged = pd.DataFrame({"_t": left_key, "_a": df[asset_col]}).merge(
         price, on=["_t", "_a"], how="left")
-    usd = merged["_usd"].fillna(0.0).to_numpy()
-    eth = merged["_eth"].fillna(0.0).to_numpy()
+    usd = merged["_usd"].to_numpy()
+    eth = merged["_eth"].to_numpy()
 
     for col in amount_columns:
-        amount = pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy()
+        amount = pd.to_numeric(df[col], errors="coerce").to_numpy()
         out[f"{col}{usd_suffix}"] = amount * usd
         out[f"{col}{eth_suffix}"] = amount * eth
     return out

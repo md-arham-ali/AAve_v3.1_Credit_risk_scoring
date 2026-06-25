@@ -36,7 +36,7 @@ def load_api_key(dotenv_path=None):
     return api_key
 
 
-def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=1000, save=True):
+def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=100000, save=True):
     """Fetch a Dune query's latest result as a DataFrame and save it to a CSV.
 
     This reads the query's most recent stored results — it does NOT re-run the
@@ -64,7 +64,7 @@ def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_li
             url,
             headers=headers,
             params={"limit": page_limit, "offset": offset},
-            timeout=60,
+            timeout=200,
         )
         response.raise_for_status()
         payload = response.json()

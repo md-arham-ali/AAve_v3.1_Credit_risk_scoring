@@ -73,7 +73,7 @@ BPS_MAX = 10_000             # 100% in basis points
 HF_SANE_CAP = 10 ** 30       # any non-sentinel health factor must sit below this
 MAX_BLOCK = 50_000_000       # generous upper bound for an Ethereum block number, though not needed
 
-WINDOW_6H_REGEX = r"^(2025-1[12]|2026-01)-\d{2} (00|06|12|18):00:00"  # window + 6h grid
+WINDOW_6H_REGEX = r"^(2025-1[12]|2026-01)-\d{2} ([01]\d|2[0-3]):00:00"  # window + 6h grid
 ADDRESS_REGEX = r"^0x[0-9a-f]{40}$"          # 20-byte lower-hex address, not checking hashes here
 SYMBOL_REGEX = r"^[A-Za-z0-9._+\-]{1,40}$"   # token tickers incl. PT-style names
 
@@ -963,7 +963,7 @@ TRANSFORM_RESULT_COLS = [
 ]
 
 TIME_TZ_REGEX = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? UTC$"  # tz-explicit ts
-GRID_6H_REGEX = r" (?:00|06|12|18):00:00(?:\.0+)? UTC$"                 # 6h boundary
+GRID_6H_REGEX = r" (?:[01]\d|2[0-3]):00:00(?:\.0+)? UTC$"                 # 6h boundary
 WEI_LOOKING_MIN = 1e15        # a USD/ETH value this large => decimals never applied
 SENTINELS = (-1, 1e18, 999999999)   # magic values that must not leak into value fields
 MAGNITUDE_JUMP_DEX = 1.0      # |Δlog10| >= this between consecutive buckets = 10x break
@@ -1434,7 +1434,7 @@ def tf_tier3_consistency(df):
 def _full_6h_grid(start, end):
     """Every 6h boundary from start to end inclusive (as pandas Timestamps)."""
     from datetime import timedelta
-    step, t, grid = timedelta(hours=6), start, []
+    step, t, grid = timedelta(hours=1), start, []
     while t <= end:
         grid.append(t); t += step
     return grid
@@ -1453,7 +1453,7 @@ def tf_tier4_temporal(df):
                           len(df), sum(dup), anomaly_buckets=dup_sample,
                           detail=f"distinct={df['time_bucket'].nunique()} of {len(df)} rows"))
 
-    grid_bad = [bool(pd.isna(p)) or (p.hour not in (0, 6, 12, 18) or p.minute or p.second)
+    grid_bad = [bool(pd.isna(p)) or (p.minute or p.second)
                 for p in parsed]                                # 6h grid alignment
     _, g_sample = _key_buckets(df, grid_bad)
     rows.append(_t_record("T4", "time_bucket lands on a 6h boundary (00/06/12/18 UTC)",

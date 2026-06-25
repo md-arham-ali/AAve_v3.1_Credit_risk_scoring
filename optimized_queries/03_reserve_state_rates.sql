@@ -19,35 +19,19 @@
 --     from tokens.erc20 get symbol = NULL. The symbol is a readability/QA label —
 --     keep joining on `asset` (address) downstream, not on the symbol.
 -- =====================================================================
-WITH agg AS (
-    SELECT
-        date_add('hour',
-                 6 * CAST(floor(hour(evt_block_time) / 6) AS bigint),
-                 date_trunc('day', evt_block_time))                            AS time_bucket,
-        reserve                                                                AS asset,
-        max_by(liquidityRate,       ROW(evt_block_number, evt_index))          AS liquidity_rate,
-        max_by(variableBorrowRate,  ROW(evt_block_number, evt_index))          AS variable_borrow_rate,
-        max_by(stableBorrowRate,    ROW(evt_block_number, evt_index))          AS stable_borrow_rate,
-        max_by(liquidityIndex,      ROW(evt_block_number, evt_index))          AS liquidity_index,
-        max_by(variableBorrowIndex, ROW(evt_block_number, evt_index))          AS variable_borrow_index,
-        COUNT(*)                                                               AS update_count
-    FROM aave_v3_ethereum.pool_evt_reservedataupdated
-    WHERE evt_block_date >= DATE '2025-11-01'
-      AND evt_block_date <  DATE '2026-02-01'
-    GROUP BY 1, 2
-)
 SELECT
-    agg.time_bucket,
-    agg.asset,
-    tok.symbol                                                                AS asset_symbol,
-    agg.liquidity_rate,
-    agg.variable_borrow_rate,
-    agg.stable_borrow_rate,
-    agg.liquidity_index,
-    agg.variable_borrow_index,
-    agg.update_count
-FROM agg
-LEFT JOIN tokens.erc20 tok
-       ON tok.blockchain = 'ethereum'
-      AND tok.contract_address = agg.asset
+    date_add('hour',
+             2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
+             date_trunc('day', evt_block_time))                                    AS time_bucket,
+    reserve                                                                        AS asset,
+    max_by(liquidityRate,       ROW(evt_block_number, evt_index))                AS liquidity_rate,
+    max_by(variableBorrowRate,  ROW(evt_block_number, evt_index))                AS variable_borrow_rate,
+    max_by(stableBorrowRate,    ROW(evt_block_number, evt_index))                AS stable_borrow_rate,
+    max_by(liquidityIndex,      ROW(evt_block_number, evt_index))                AS liquidity_index,
+    max_by(variableBorrowIndex, ROW(evt_block_number, evt_index))                AS variable_borrow_index,
+    COUNT(*)                                                                       AS update_count
+FROM aave_v3_ethereum.pool_evt_reservedataupdated
+WHERE evt_block_date >= DATE '2025-04-01'
+  AND evt_block_date <  DATE '2026-03-31'
+GROUP BY 1, 2
 ORDER BY 1, 2

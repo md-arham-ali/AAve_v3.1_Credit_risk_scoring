@@ -19,20 +19,20 @@
 -- =====================================================================
 SELECT
     date_add('hour',
-             6 * CAST(floor(hour(call_block_time) / 6) AS bigint),
+             2 * CAST(floor(hour(call_block_time) / 2) AS bigint),
              date_trunc('day', call_block_time))                               AS time_bucket,
     AVG(CAST(output_totalCollateralBase        AS double))                    AS avg_total_collateral_base,
     AVG(CAST(output_totalDebtBase              AS double))                    AS avg_total_debt_base,
     AVG(CAST(output_availableBorrowsBase       AS double))                    AS avg_available_borrows_base,
     AVG(CAST(output_currentLiquidationThreshold AS double))                   AS avg_current_liquidation_threshold,
     AVG(CAST(output_ltv                        AS double))                    AS avg_ltv,
-    MIN(output_healthFactor)                                                  AS min_health_factor,
-    MAX(output_healthFactor)                                                  AS max_health_factor,
+    CAST(MIN(output_healthFactor) AS double)                                  AS min_health_factor,
+    CAST(MAX(output_healthFactor) AS double)                                  AS max_health_factor,
     approx_distinct("user")                                                   AS sampled_user_count,
     COUNT(*)                                                                  AS account_data_call_count
 FROM aave_v3_ethereum.pool_call_getuseraccountdata
-WHERE call_block_date >= DATE '2025-11-01'
-  AND call_block_date <  DATE '2026-02-01'
+WHERE call_block_date >= DATE '2025-04-01'
+  AND call_block_date <  DATE '2026-04-01'
   AND call_success
 GROUP BY 1
 ORDER BY 1
