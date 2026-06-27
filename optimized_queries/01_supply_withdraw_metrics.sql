@@ -23,69 +23,37 @@
 --     from tokens.erc20 get symbol = NULL. The symbol is a readability/QA label —
 --     keep joining on `asset` (address) downstream, not on the symbol.
 -- =====================================================================
-WITH events AS (
-    SELECT
-        reserve            AS asset,
-        evt_block_time,
-        evt_block_number,
-        evt_index,
-        amount,
-        "user"             AS actor,
-        'supply'           AS kind
-    FROM aave_v3_ethereum.pool_evt_supply
-    WHERE evt_block_date >= DATE '2025-04-01'
-      AND evt_block_date <= DATE '2026-03-31'
-
-    UNION ALL
-
-    SELECT
-        reserve            AS asset,
-        evt_block_time,
-        evt_block_number,
-        evt_index,
-        amount,
-        "user"             AS actor,
-        'withdraw'         AS kind
-    FROM aave_v3_ethereum.pool_evt_withdraw
-    WHERE evt_block_date >= DATE '2025-04-01'
-      AND evt_block_date <= DATE '2026-03-31'
-),
-agg AS (
+WITH agg AS (
     SELECT
         date_add('hour',
                  2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
-                 date_trunc('day', evt_block_time))                            AS time_bucket,
+                 date_trunc('day', evt_block_time))                                AS time_bucket,
         asset,
-        -- cumulative raw flows in the bucket
-        SUM(CASE WHEN kind = 'supply'   THEN amount END)                       AS supply_amount_raw,
-        SUM(CASE WHEN kind = 'withdraw' THEN amount END)                       AS withdrawal_amount_raw,
-        -- signed net flow: supply inflow (+), withdrawal outflow (-)
-        SUM(CASE WHEN kind = 'supply'   THEN  CAST(amount AS int256)
-                 WHEN kind = 'withdraw' THEN -CAST(amount AS int256) END)      AS net_supply_flow_raw,
-        -- activity counts
-        COUNT(CASE WHEN kind = 'supply'   THEN 1 END)                          AS supply_tx_count,
-        COUNT(CASE WHEN kind = 'withdraw' THEN 1 END)                          AS withdrawal_tx_count,
-        approx_distinct(CASE WHEN kind = 'supply'   THEN actor END)            AS unique_suppliers,
-        approx_distinct(CASE WHEN kind = 'withdraw' THEN actor END)            AS unique_withdraw_users,
-        -- end-of-period block markers (for downstream ordering / dedup)
-        MAX(CASE WHEN kind = 'supply'   THEN evt_block_number END)             AS latest_supply_block,
-        MAX(CASE WHEN kind = 'withdraw' THEN evt_block_number END)             AS latest_withdraw_block
-    FROM events
+        SUM(amount)                                                               AS flashloan_amount_raw,
+        SUM(premium)                                                              AS flashloan_premium_raw,
+        COUNT(*)                                                                  AS flashloan_tx_count,
+        approx_distinct(initiator)                                               AS unique_flashloan_initiators,
+        COUNT(CASE WHEN interestRateMode = 0 THEN 1 END)                          AS no_open_debt_flashloan_tx_count,
+        COUNT(CASE WHEN interestRateMode = 1 THEN 1 END)                          AS stable_flashloan_tx_count,
+        COUNT(CASE WHEN interestRateMode = 2 THEN 1 END)                          AS variable_flashloan_tx_count,
+        MAX(evt_block_number)                                                     AS latest_flashloan_block
+    FROM aave_v3_ethereum.pool_evt_flashloan
+    WHERE evt_block_date >= DATE '2025-04-01'
+      AND evt_block_date < DATE '2026-04-01'
     GROUP BY 1, 2
 )
 SELECT
     agg.time_bucket,
     agg.asset,
-    tok.symbol                                                                AS asset_symbol,
-    agg.supply_amount_raw,
-    agg.withdrawal_amount_raw,
-    agg.net_supply_flow_raw,
-    agg.supply_tx_count,
-    agg.withdrawal_tx_count,
-    agg.unique_suppliers,
-    agg.unique_withdraw_users,
-    agg.latest_supply_block,
-    agg.latest_withdraw_block
+    tok.symbol                                                                    AS asset_symbol,
+    CAST(agg.flashloan_amount_raw AS DOUBLE) / POW(10, tok.decimals)            AS flashloan_amount,
+    CAST(agg.flashloan_premium_raw AS DOUBLE) / POW(10, tok.decimals)           AS flashloan_premium,
+    agg.flashloan_tx_count,
+    agg.unique_flashloan_initiators,
+    agg.no_open_debt_flashloan_tx_count,
+    agg.stable_flashloan_tx_count,
+    agg.variable_flashloan_tx_count,
+    agg.latest_flashloan_block
 FROM agg
 LEFT JOIN tokens.erc20 tok
        ON tok.blockchain = 'ethereum'

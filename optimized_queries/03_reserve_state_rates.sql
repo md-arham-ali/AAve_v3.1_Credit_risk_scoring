@@ -24,11 +24,11 @@ SELECT
              2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
              date_trunc('day', evt_block_time))                                    AS time_bucket,
     reserve                                                                        AS asset,
-    max_by(liquidityRate,       ROW(evt_block_number, evt_index))                AS liquidity_rate,
-    max_by(variableBorrowRate,  ROW(evt_block_number, evt_index))                AS variable_borrow_rate,
-    max_by(stableBorrowRate,    ROW(evt_block_number, evt_index))                AS stable_borrow_rate,
-    max_by(liquidityIndex,      ROW(evt_block_number, evt_index))                AS liquidity_index,
-    max_by(variableBorrowIndex, ROW(evt_block_number, evt_index))                AS variable_borrow_index,
+    max_by(liquidityRate,       ROW(evt_block_number, evt_index)) / 1e27          AS liquidity_rate,
+    max_by(variableBorrowRate,  ROW(evt_block_number, evt_index)) / 1e27          AS variable_borrow_rate,
+    max_by(stableBorrowRate,    ROW(evt_block_number, evt_index)) / 1e27          AS stable_borrow_rate,
+    max_by(liquidityIndex,      ROW(evt_block_number, evt_index)) / 1e27          AS liquidity_index,
+    max_by(variableBorrowIndex, ROW(evt_block_number, evt_index)) / 1e27          AS variable_borrow_index,
     COUNT(*)                                                                       AS update_count
 FROM aave_v3_ethereum.pool_evt_reservedataupdated
 WHERE evt_block_date >= DATE '2025-04-01'
