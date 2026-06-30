@@ -24,7 +24,9 @@ Libraries imported: numpy, pandas, math, adv_validation (decimals-safe parsing +
 robust moments).
 """
 
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -43,8 +45,8 @@ __all__ = [
     # drawdown
     "max_drawdown", "average_drawdown", "ulcer_index",
     # volatility / dispersion
-    "realized_volatility", "robust_cv", "quartile_coeff_dispersion",
-    "mean_abs_deviation", "coefficient_of_variation",
+    "realized_volatility", "rolling_volatility", "robust_cv",
+    "quartile_coeff_dispersion", "mean_abs_deviation", "coefficient_of_variation",
     # distribution shape
     "moment_skewness", "excess_kurtosis", "bowley_skewness", "kelly_skewness",
     "nonparametric_skew", "bimodality_coefficient", "jarque_bera",
@@ -55,8 +57,15 @@ __all__ = [
     "sharpe_ratio", "sortino_ratio", "calmar_ratio", "omega_ratio",
     # dependence / memory
     "autocorrelation", "hurst_exponent",
+    # cross-column structure
+    "correlation_clusters",
     # convenience
     "financial_metrics",
+    # shared column-priority map (file-backed, live across notebooks)
+    "PRIORITY_PATH", "load_priorities", "get_priorities", "get_priority",
+    "set_priority", "update_priorities", "register_columns",
+    "bump_priority", "increase_priority", "decrease_priority",
+    "remove_priority", "reset_priorities",
 ]
 
 
@@ -236,6 +245,31 @@ def realized_volatility(data, column=None, periods_per_year=None, as_returns=Tru
     if x.size < 2:
         return np.nan
     return float(np.std(x, ddof=1) * _ann(periods_per_year))
+
+
+def rolling_volatility(data, column=None, window=12, min_periods=None, as_returns=False):
+    """Time-varying (rolling) standard deviation, ALIGNED to the input rows.
+
+    Unlike :func:`realized_volatility` (one number for the whole series) this returns a
+    pd.Series the same length/index as the input — its value at row t is the local
+    volatility of the preceding ``window`` observations. It is the signal used to label
+    each time bucket calm / normal / turbulent for a temporal-regime row split.
+
+    Position-aligned, so (unlike the other metrics) it does NOT drop rows via ``_clean``
+    — values are read with ``pd.to_numeric`` (the transformed frame is already numeric);
+    only the leading rows with fewer than ``min_periods`` observations are NaN.
+
+    ``as_returns=False`` measures volatility of the level/flow as-is; ``True`` takes
+    percentage changes first. ``min_periods`` defaults to ``max(2, window // 3)``.
+    """
+    s = data[column] if column is not None else pd.Series(list(data))
+    s = pd.to_numeric(s, errors="coerce")
+    if as_returns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = s.pct_change()
+    if min_periods is None:
+        min_periods = max(2, window // 3)
+    return s.rolling(window, min_periods=min_periods).std(ddof=1)
 
 
 def robust_cv(data, column=None, method="mad"):
@@ -495,6 +529,73 @@ def hurst_exponent(data, column=None):
 
 
 # --------------------------------------------------------------------------- #
+# Cross-column structure (co-movement) — groups columns, not rows
+# --------------------------------------------------------------------------- #
+def correlation_clusters(df, columns=None, n_clusters=6, absolute=True,
+                         method="pearson", linkage="complete"):
+    """Group columns into ``n_clusters`` by co-movement (agglomerative clustering).
+
+    Pure numpy/pandas (no scipy): builds a correlation matrix over ``columns``, turns it
+    into a distance ``d = 1 - |corr|`` (so strongly correlated columns are "close"),
+    then repeatedly merges the two closest clusters until ``n_clusters`` remain.
+    Columns that move together (redundant features) land together.
+
+    Parameters
+    ----------
+    columns : list[str] | None
+        Columns to cluster. Defaults to every numeric column.
+    n_clusters : int
+        Number of groups to cut to.
+    absolute : bool
+        Use ``|corr|`` (group columns that move together OR exactly opposite). Set
+        False to keep sign so anti-correlated columns stay apart.
+    method : str
+        Correlation method passed to ``DataFrame.corr`` ('pearson' / 'spearman').
+    linkage : str
+        Inter-cluster distance rule: ``'complete'`` (max pairwise distance; default —
+        compact, balanced clusters, avoids the chaining that makes ``'average'`` /
+        ``'single'`` collapse weakly-related columns into one mega-cluster),
+        ``'average'`` (mean), or ``'single'`` (min).
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ``{"cluster_1": [...], ...}``, ordered largest cluster first.
+    """
+    cols = (list(columns) if columns is not None
+            else df.select_dtypes("number").columns.tolist())
+    X = df[cols].apply(pd.to_numeric, errors="coerce")
+    corr = X.corr(method=method)
+    C = corr.abs().to_numpy() if absolute else corr.to_numpy()
+    D = 1.0 - np.nan_to_num(C, nan=0.0)              # distance; NaN corr -> max distance
+    n = len(cols)
+    n_clusters = max(1, min(n_clusters, n))
+    reduce = {"complete": np.max, "average": np.mean, "single": np.min}[linkage]
+
+    members = {i: [i] for i in range(n)}             # cluster id -> member column indices
+    active = list(range(n))
+    next_id = n
+    while len(active) > n_clusters:
+        # closest active pair under the chosen linkage rule
+        best, best_d = None, None
+        for a in range(len(active)):
+            for b in range(a + 1, len(active)):
+                ma, mb = members[active[a]], members[active[b]]
+                d = float(reduce(D[np.ix_(ma, mb)]))
+                if best_d is None or d < best_d:
+                    best_d, best = d, (active[a], active[b])
+        i, j = best
+        members[next_id] = members[i] + members[j]
+        active.remove(i)
+        active.remove(j)
+        active.append(next_id)
+        next_id += 1
+
+    groups = sorted((members[c] for c in active), key=len, reverse=True)
+    return {f"cluster_{k + 1}": [cols[m] for m in g] for k, g in enumerate(groups)}
+
+
+# --------------------------------------------------------------------------- #
 # Convenience — run every metric over one column
 # --------------------------------------------------------------------------- #
 def financial_metrics(data, column=None, periods_per_year=None, as_returns=True):
@@ -544,3 +645,121 @@ def financial_metrics(data, column=None, periods_per_year=None, as_returns=True)
         "autocorrelation_lag1": autocorrelation(data, column, lag=1),
         "hurst_exponent": hurst_exponent(data, column),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Shared column-priority map (file-backed → live across notebooks)
+# --------------------------------------------------------------------------- #
+# A {column: score} map you tune as the EDA progresses (raise / lower a column's
+# priority). It is persisted to ONE JSON file so every notebook in this directory
+# reads and writes the SAME map: a change made in one notebook is picked up by
+# another the next time it calls get_priorities() / get_priority() — each call reads
+# the file fresh, so there is no in-process copy to go stale. The path is anchored to
+# the repo root (parent of src/), so it resolves identically regardless of a notebook's CWD.
+PRIORITY_PATH = Path(__file__).resolve().parent.parent / "column_priority.json"
+DEFAULT_PRIORITY = 0.0
+
+
+def load_priorities(path=PRIORITY_PATH):
+    """Read the shared ``{column: score}`` map from disk (the single source of truth).
+
+    Returns an empty dict if the file is missing or unreadable, so a fresh project
+    just starts empty.
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return {str(k): float(v) for k, v in raw.items()}
+
+
+def _save_priorities(scores, path=PRIORITY_PATH):
+    """Write the map atomically (temp file + replace) so a concurrent reader in another
+    notebook never sees a half-written file."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({str(k): float(v) for k, v in scores.items()}, fh,
+                  indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
+def get_priorities(path=PRIORITY_PATH):
+    """The priority map as a DataFrame ``[column, score]``, highest score first.
+
+    Reads the file on every call, so the frame always reflects edits made in other
+    notebooks. Assign it (``priority_df = eda.get_priorities()``) and re-run to refresh.
+    """
+    scores = load_priorities(path)
+    df = pd.DataFrame(list(scores.items()), columns=["column", "score"])
+    return df.sort_values("score", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def get_priority(column, path=PRIORITY_PATH, default=DEFAULT_PRIORITY):
+    """Current score for one column (``default`` if it is not in the map yet)."""
+    return load_priorities(path).get(str(column), default)
+
+
+def set_priority(column, score, path=PRIORITY_PATH):
+    """Set a column's ABSOLUTE score, persist, and return the refreshed map DataFrame."""
+    scores = load_priorities(path)
+    scores[str(column)] = float(score)
+    _save_priorities(scores, path)
+    return get_priorities(path)
+
+
+def update_priorities(mapping, path=PRIORITY_PATH):
+    """Set several columns at once from a ``{column: score}`` dict. Returns the map df."""
+    scores = load_priorities(path)
+    for col, score in dict(mapping).items():
+        scores[str(col)] = float(score)
+    _save_priorities(scores, path)
+    return get_priorities(path)
+
+
+def register_columns(columns, default=DEFAULT_PRIORITY, path=PRIORITY_PATH, overwrite=False):
+    """Seed many columns into the map at ``default`` score. Existing scores are KEPT
+    unless ``overwrite=True`` — so re-running a seed cell never wipes tuning done elsewhere."""
+    scores = load_priorities(path)
+    for col in columns:
+        if overwrite or str(col) not in scores:
+            scores[str(col)] = float(default)
+    _save_priorities(scores, path)
+    return get_priorities(path)
+
+
+def bump_priority(column, by=1.0, path=PRIORITY_PATH, default=DEFAULT_PRIORITY):
+    """Add ``by`` to a column's score (negative lowers it); creates it at ``default`` first
+    if unseen. Returns the refreshed map df."""
+    scores = load_priorities(path)
+    scores[str(column)] = scores.get(str(column), default) + float(by)
+    _save_priorities(scores, path)
+    return get_priorities(path)
+
+
+def increase_priority(column, by=1.0, path=PRIORITY_PATH):
+    """Raise a column's priority by ``by`` (convenience wrapper over bump_priority)."""
+    return bump_priority(column, abs(by), path)
+
+
+def decrease_priority(column, by=1.0, path=PRIORITY_PATH):
+    """Lower a column's priority by ``by`` (convenience wrapper over bump_priority)."""
+    return bump_priority(column, -abs(by), path)
+
+
+def remove_priority(column, path=PRIORITY_PATH):
+    """Drop a column from the map. Returns the refreshed map df."""
+    scores = load_priorities(path)
+    scores.pop(str(column), None)
+    _save_priorities(scores, path)
+    return get_priorities(path)
+
+
+def reset_priorities(path=PRIORITY_PATH):
+    """Clear the entire map (writes an empty file). Returns the (empty) map df."""
+    _save_priorities({}, path)
+    return get_priorities(path)
