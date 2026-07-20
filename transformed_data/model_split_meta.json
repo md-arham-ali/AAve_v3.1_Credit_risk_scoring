@@ -1,0 +1,422 @@
+{
+ "feature_cols": [
+  "liquidation_tx_count",
+  "unique_liquidated_users",
+  "unique_liquidators",
+  "as_collateral_tx_count",
+  "as_debt_tx_count",
+  "liquidated_collateral_value_usd",
+  "liquidated_collateral_value_eth",
+  "liquidation_debt_covered_value_usd",
+  "liquidation_debt_covered_value_eth",
+  "liquidation_rate",
+  "liquidation_volume_ratio_eth",
+  "liquidation_severity_usd",
+  "liquidation_severity_eth",
+  "avg_liquidation_debt_usd",
+  "avg_liquidation_debt_eth",
+  "liquidator_concentration",
+  "liquidation_user_ratio",
+  "market_stress_index_usd",
+  "market_stress_index_eth",
+  "has_liquidation",
+  "avg_total_collateral_base",
+  "avg_total_debt_base",
+  "avg_available_borrows_base",
+  "avg_current_liquidation_threshold",
+  "avg_ltv",
+  "borrow_capacity_utilization",
+  "remaining_borrow_capacity",
+  "risk_buffer",
+  "ltv_utilization",
+  "distance_to_liquidation",
+  "debt_expansion_ratio",
+  "capital_efficiency",
+  "overcollateral_margin",
+  "has_sampled_borrow_position",
+  "borrow_tx_count",
+  "unique_borrowers",
+  "borrow_amount_value_usd",
+  "borrow_amount_value_eth",
+  "repay_amount_value_usd",
+  "borrow_repay_ratio",
+  "repayment_discipline",
+  "net_borrow_demand_usd",
+  "borrower_participation_rate",
+  "leverage_indicator",
+  "collateral_enabled_count",
+  "collateral_disabled_count",
+  "collateral_usage_rate",
+  "net_liquidity_flow_usd",
+  "supply_withdrawal_ratio",
+  "protocol_turnover_usd",
+  "flashloan_usage_intensity",
+  "flashloan_amount_value_usd",
+  "user_activity"
+ ],
+ "thresholds": {
+  "1": 339172.08656369784,
+  "3": 1639942.635083635,
+  "7": 3859058.5163075393
+ },
+ "scaler_params": {
+  "liquidation_tx_count": {
+   "mean": 2.4113852554590274,
+   "std": 1.4853308738874684,
+   "median": 2.1972245773362196
+  },
+  "unique_liquidated_users": {
+   "mean": 2.380449328979946,
+   "std": 1.4843084874555748,
+   "median": 2.1972245773362196
+  },
+  "unique_liquidators": {
+   "mean": 2.238583410126683,
+   "std": 1.26391802056495,
+   "median": 2.1972245773362196
+  },
+  "as_collateral_tx_count": {
+   "mean": 1.883588373394941,
+   "std": 1.3412680724958805,
+   "median": 1.6094379124341003
+  },
+  "as_debt_tx_count": {
+   "mean": 1.883588373394941,
+   "std": 1.3412680724958805,
+   "median": 1.6094379124341003
+  },
+  "liquidated_collateral_value_usd": {
+   "mean": 8.922830026092296,
+   "std": 4.823210612917978,
+   "median": 9.683907303358101
+  },
+  "liquidated_collateral_value_eth": {
+   "mean": 2.627355144368236,
+   "std": 2.687821902942046,
+   "median": 1.9149228570752423
+  },
+  "liquidation_debt_covered_value_usd": {
+   "mean": 8.87258744439925,
+   "std": 4.808555064515447,
+   "median": 9.62472090147444
+  },
+  "liquidation_debt_covered_value_eth": {
+   "mean": 2.5915744642904945,
+   "std": 2.6660676441720494,
+   "median": 1.8685520307367192
+  },
+  "liquidation_rate": {
+   "mean": 0.03227732199783227,
+   "std": 0.10674330843675564,
+   "median": 0.007373461882953747
+  },
+  "liquidation_volume_ratio_eth": {
+   "mean": 0.004571547376742394,
+   "std": 0.021220327329694158,
+   "median": 2.653470402089109e-05
+  },
+  "liquidation_severity_usd": {
+   "mean": 6.658543199187047,
+   "std": 3.5907977260429886,
+   "median": 7.497114354268435
+  },
+  "liquidation_severity_eth": {
+   "mean": 0.9675925286013318,
+   "std": 1.1165640162149766,
+   "median": 0.5051091298057936
+  },
+  "avg_liquidation_debt_usd": {
+   "mean": 6.60903751152837,
+   "std": 3.5758180049793795,
+   "median": 7.434119526088416
+  },
+  "avg_liquidation_debt_eth": {
+   "mean": 0.9426396930076627,
+   "std": 1.096427822099569,
+   "median": 0.4646540562937612
+  },
+  "liquidator_concentration": {
+   "mean": 0.7675017519180013,
+   "std": 0.311344287358801,
+   "median": 0.8875
+  },
+  "liquidation_user_ratio": {
+   "mean": 0.04212085105583391,
+   "std": 0.13261340439432842,
+   "median": 0.009806161557059902
+  },
+  "market_stress_index_usd": {
+   "mean": 0.19904275206681168,
+   "std": 0.8391106507061253,
+   "median": 0.00022538634312167406
+  },
+  "market_stress_index_eth": {
+   "mean": 0.20055063264909875,
+   "std": 0.8442195141305965,
+   "median": 0.00022562065398172234
+  },
+  "has_liquidation": {
+   "mean": 0.9049586776859504,
+   "std": 0.2938798240479883,
+   "median": 1.0
+  },
+  "avg_total_collateral_base": {
+   "mean": 51995851.36278702,
+   "std": 44670917.79819032,
+   "median": 42518403.82997611
+  },
+  "avg_total_debt_base": {
+   "mean": 16.318466805434824,
+   "std": 2.1543970250941666,
+   "median": 16.82924444605659
+  },
+  "avg_available_borrows_base": {
+   "mean": 14887582.54229338,
+   "std": 15177135.781060666,
+   "median": 10291648.613630218
+  },
+  "avg_current_liquidation_threshold": {
+   "mean": 0.8206634584106746,
+   "std": 0.07497873738819755,
+   "median": 0.8294651515151514
+  },
+  "avg_ltv": {
+   "mean": 0.7935531618321555,
+   "std": 0.07471427590021465,
+   "median": 0.8010291666666667
+  },
+  "borrow_capacity_utilization": {
+   "mean": 0.6265659348642586,
+   "std": 0.19464892261066016,
+   "median": 0.6510845223820456
+  },
+  "remaining_borrow_capacity": {
+   "mean": 0.29491428711900897,
+   "std": 0.14674707428745043,
+   "median": 0.27812227945340656
+  },
+  "risk_buffer": {
+   "mean": 0.027110296578519027,
+   "std": 0.0055880652029535955,
+   "median": 0.026426769406392603
+  },
+  "ltv_utilization": {
+   "mean": 0.966775545268123,
+   "std": 0.007147326566751233,
+   "median": 0.9677521925677879
+  },
+  "distance_to_liquidation": {
+   "mean": 0.033224454731876865,
+   "std": 0.007147326566751231,
+   "median": 0.0322478074322121
+  },
+  "debt_expansion_ratio": {
+   "mean": 0.515660975762861,
+   "std": 0.18969243726253915,
+   "median": 0.5091152042863486
+  },
+  "capital_efficiency": {
+   "mean": 3.1690759350819966,
+   "std": 1.9290708448139715,
+   "median": 2.773797422792639
+  },
+  "overcollateral_margin": {
+   "mean": 24618778.333853543,
+   "std": 23413700.105685234,
+   "median": 18474801.741307013
+  },
+  "borrow_tx_count": {
+   "mean": 1296.1198347107438,
+   "std": 471.55060505943874,
+   "median": 1199.5
+  },
+  "unique_borrowers": {
+   "mean": 912.404958677686,
+   "std": 271.0395564066899,
+   "median": 880.0
+  },
+  "borrow_amount_value_usd": {
+   "mean": 663297927.5804306,
+   "std": 401761255.07603735,
+   "median": 591707217.7008595
+  },
+  "borrow_amount_value_eth": {
+   "mean": 212911.9477053842,
+   "std": 118394.52561083484,
+   "median": 182053.4282789824
+  },
+  "repay_amount_value_usd": {
+   "mean": 645438874.5728896,
+   "std": 412800730.4794678,
+   "median": 563291406.3082054
+  },
+  "borrow_repay_ratio": {
+   "mean": 1.0600545191825714,
+   "std": 0.26671932059728176,
+   "median": 1.0336586945565616
+  },
+  "repayment_discipline": {
+   "mean": 0.5076989048272521,
+   "std": 0.11012535251005735,
+   "median": 0.47878173254655587
+  },
+  "net_borrow_demand_usd": {
+   "mean": 17859053.00754106,
+   "std": 177090664.19835714,
+   "median": 15134925.067279886
+  },
+  "borrower_participation_rate": {
+   "mean": 0.4523972678695506,
+   "std": 0.04703502033412384,
+   "median": 0.4607519003783423
+  },
+  "leverage_indicator": {
+   "mean": 0.25657648197896726,
+   "std": 0.14155894291051813,
+   "median": 0.2277240612777281
+  },
+  "collateral_enabled_count": {
+   "mean": 1397.1198347107438,
+   "std": 486.5297282298635,
+   "median": 1325.5
+  },
+  "collateral_disabled_count": {
+   "mean": 1206.297520661157,
+   "std": 481.29037559147275,
+   "median": 1086.0
+  },
+  "collateral_usage_rate": {
+   "mean": 0.5398523584660907,
+   "std": 0.020685349449640615,
+   "median": 0.5354674720592134
+  },
+  "net_liquidity_flow_usd": {
+   "mean": 44526147.20995913,
+   "std": 422557777.45255744,
+   "median": 66724730.42515147
+  },
+  "supply_withdrawal_ratio": {
+   "mean": 1.044668650563543,
+   "std": 0.22676239831644893,
+   "median": 1.0238105851064847
+  },
+  "protocol_turnover_usd": {
+   "mean": 7613598313.949341,
+   "std": 4898892864.944933,
+   "median": 6794035537.450108
+  },
+  "flashloan_usage_intensity": {
+   "mean": 0.07668458636862883,
+   "std": 0.02534481329106877,
+   "median": 0.07068540061372064
+  },
+  "flashloan_amount_value_usd": {
+   "mean": 17.10029607332481,
+   "std": 0.8455868355694081,
+   "median": 17.050217897016843
+  },
+  "user_activity": {
+   "mean": 2197.53305785124,
+   "std": 657.8132774817445,
+   "median": 2122.0
+  }
+ },
+ "feature_transform": {
+  "log1p_cols": [
+   "liquidation_tx_count",
+   "unique_liquidated_users",
+   "unique_liquidators",
+   "as_collateral_tx_count",
+   "as_debt_tx_count",
+   "liquidated_collateral_value_usd",
+   "liquidated_collateral_value_eth",
+   "liquidation_debt_covered_value_usd",
+   "liquidation_debt_covered_value_eth",
+   "liquidation_rate",
+   "liquidation_volume_ratio_eth",
+   "liquidation_severity_usd",
+   "liquidation_severity_eth",
+   "avg_liquidation_debt_usd",
+   "avg_liquidation_debt_eth",
+   "liquidation_user_ratio",
+   "market_stress_index_usd",
+   "market_stress_index_eth",
+   "avg_total_debt_base",
+   "capital_efficiency",
+   "repayment_discipline",
+   "flashloan_amount_value_usd"
+  ],
+  "dropped": [
+   "has_sampled_borrow_position"
+  ],
+  "kept": [
+   "liquidation_tx_count",
+   "unique_liquidated_users",
+   "unique_liquidators",
+   "as_collateral_tx_count",
+   "as_debt_tx_count",
+   "liquidated_collateral_value_usd",
+   "liquidated_collateral_value_eth",
+   "liquidation_debt_covered_value_usd",
+   "liquidation_debt_covered_value_eth",
+   "liquidation_rate",
+   "liquidation_volume_ratio_eth",
+   "liquidation_severity_usd",
+   "liquidation_severity_eth",
+   "avg_liquidation_debt_usd",
+   "avg_liquidation_debt_eth",
+   "liquidator_concentration",
+   "liquidation_user_ratio",
+   "market_stress_index_usd",
+   "market_stress_index_eth",
+   "has_liquidation",
+   "avg_total_collateral_base",
+   "avg_total_debt_base",
+   "avg_available_borrows_base",
+   "avg_current_liquidation_threshold",
+   "avg_ltv",
+   "borrow_capacity_utilization",
+   "remaining_borrow_capacity",
+   "risk_buffer",
+   "ltv_utilization",
+   "distance_to_liquidation",
+   "debt_expansion_ratio",
+   "capital_efficiency",
+   "overcollateral_margin",
+   "borrow_tx_count",
+   "unique_borrowers",
+   "borrow_amount_value_usd",
+   "borrow_amount_value_eth",
+   "repay_amount_value_usd",
+   "borrow_repay_ratio",
+   "repayment_discipline",
+   "net_borrow_demand_usd",
+   "borrower_participation_rate",
+   "leverage_indicator",
+   "collateral_enabled_count",
+   "collateral_disabled_count",
+   "collateral_usage_rate",
+   "net_liquidity_flow_usd",
+   "supply_withdrawal_ratio",
+   "protocol_turnover_usd",
+   "flashloan_usage_intensity",
+   "flashloan_amount_value_usd",
+   "user_activity"
+  ]
+ },
+ "embargo_days": 7,
+ "boundaries": {
+  "train": [
+   "2025-04-01 00:00:00.000 UTC",
+   "2025-11-28 00:00:00.000 UTC"
+  ],
+  "val": [
+   "2025-12-06 00:00:00.000 UTC",
+   "2026-01-20 00:00:00.000 UTC"
+  ],
+  "test": [
+   "2026-01-28 00:00:00.000 UTC",
+   "2026-03-23 00:00:00.000 UTC"
+  ]
+ }
+}
