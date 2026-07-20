@@ -21,6 +21,10 @@ from pathlib import Path
 
 import pandas as pd
 
+# Make sibling src/ modules importable however this file is loaded (notebook, script, or import).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from data_validation import TABLE_LABELS, table_name_from_path
 
 # Folder holding the raw, versioned extracts. Read-only from this stage.
@@ -332,6 +336,74 @@ def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
         out[f"{col}{usd_suffix}"] = amount * usd
         out[f"{col}{eth_suffix}"] = amount * eth
     return out
+
+# --------------------------------------------------------------------------- #
+# Null repair after the protocol-panel merge (left joins on time_bucket)
+# --------------------------------------------------------------------------- #
+# The final merge left-joins per-table 6h/2h aggregates onto the supply/withdraw
+# bucket grid, which produces two very different kinds of null:
+#   (1) EVENT columns (tx counts, unique users, valued sums): a bucket missing
+#       from a source table means NO events happened there — the true value is 0,
+#       not "unknown". Left as null they read as >70% missing (liquidations are
+#       rare per 2h bucket) and poison every downstream ratio.
+#   (2) STATE columns (user-account avg_* collateral/debt/ltv): sampled from
+#       getUserAccountData calls that land in only ~half the buckets. State
+#       persists between observations, so the last observed value is carried
+#       forward (same treatment as the reserve_config state panel), bounded by a
+#       staleness cap.
+
+def fill_event_zeros(df, columns):
+    """Fill nulls with 0 in EVENT columns (structural zeros from left joins).
+
+    Returns a NEW DataFrame. Only use on additive event aggregates (counts,
+    unique-user counts, valued sums) where an absent bucket means "no events" —
+    never on sampled state or ratio columns, where null means "not observed".
+    """
+    out = df.copy()
+    cols = [c for c in columns if c in out.columns]
+    out[cols] = out[cols].fillna(0)
+    return out
+
+
+def ffill_state_columns(df, columns, time_col="time_bucket", limit=None,
+                        observed_col=None, age_col=None):
+    """Forward-fill sampled STATE columns along the time axis.
+
+    Returns a NEW DataFrame in the original row order. Rows are ordered by the
+    parsed ``time_col`` for the fill, so the frame does not have to be pre-sorted.
+
+    Parameters
+    ----------
+    columns : list[str]
+        The state columns to carry forward (filled together, so a bucket keeps a
+        consistent snapshot from a single observation).
+    limit : int | None
+        Staleness cap — the maximum number of consecutive buckets a value may be
+        carried. ``None`` carries indefinitely.
+    observed_col : str | None
+        If given, adds a boolean column: True where the bucket had its own
+        observation (any state column non-null before the fill).
+    age_col : str | None
+        If given, adds an int column: buckets since the last observation
+        (0 = observed in this bucket; null before the first observation).
+    """
+    order = pd.to_datetime(df[time_col], utc=True, format="mixed").sort_values().index
+    out = df.copy()
+    cols = [c for c in columns if c in out.columns]
+
+    block = out.loc[order, cols]           # time-ordered view of the state columns
+    observed = block.notna().any(axis=1)   # bucket had its own observation
+    out.loc[order, cols] = block.ffill(limit=limit)
+
+    # metadata columns assign back by index, so they land on the right rows
+    if observed_col:
+        out[observed_col] = observed
+    if age_col:
+        # buckets since the last observed row: position - position of last observation
+        pos = pd.Series(range(len(order)), index=order, dtype="float64")
+        out[age_col] = pos - pos.where(observed).ffill()
+    return out
+
 
 def aggregate_by_time_bucket(df, time_col, group_cols, agg_func='sum', freq=None):
     if isinstance(agg_func, str):

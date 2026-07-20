@@ -31,6 +31,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Make sibling src/ modules importable however this file is loaded (notebook, script, or import).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import adv_validation as adv
 
 # Period counts for annualisation on this project's grids (365-day year).

@@ -53,3 +53,13 @@ yarl==1.24.2
 pandas
 python-dotenv
 matplotlib
+# modeling stage (E30) — requires the OpenMP runtime on macOS: brew install libomp
+# ⚠️ lifelines declares pandas<3.0 but CoxPHFitter verified working on pandas 3.0.3;
+#    installing it re-pins pandas 2.x — re-run `pip install pandas` after if needed
+scikit-learn==1.9.0
+scipy==1.18.0
+xgboost==3.3.0
+lightgbm==4.6.0
+lifelines==0.30.3
+torch==2.12.1
+great_expectations==0.18.22

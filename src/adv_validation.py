@@ -60,6 +60,10 @@ from decimal import Decimal
 
 import pandas as pd
 
+# Make sibling src/ modules importable however this file is loaded (notebook, script, or import).
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # Reuse the loaders/keys already defined for the basic suite (no duplication).
 from data_validation import load_csv, table_name_from_path, key_columns, ADDRESS_COLS
 

@@ -45,7 +45,9 @@ Libraries imported by this module:
 import numpy as np
 import pandas as pd
 
-import  adv_validation as adv
+# Make sibling src/ modules importable however this file is loaded (notebook, script, or import).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import EDA
 import adv_validation as adv
@@ -55,7 +57,7 @@ STAT_COLS = adv.STAT_COLS
 
 # Default signal columns (present in DF_common_final_1).
 FLOW_COL = "net_liquidity_flow_usd"      # umbrella 5 — directional throughput
-ACTIVITY_COL = "total_activity"          # umbrella 6 — transaction count
+ACTIVITY_COL = "user_activity"           # umbrella 6 — per-bucket active-user count
 VOLUME_COL = "protocol_turnover_usd"     # umbrella 7 — $ throughput (numerator)
 
 
