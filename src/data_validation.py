@@ -23,7 +23,11 @@ TABLE_LABELS = {
     "7702138": "supply_withdraw",
     "7798273": "borrow_repay",
     "7711042": "reserve_state_rates",
-    "7798416": "reserve_config",
+    # 7804264, not the pre-E20 7798416: reserve_config was re-run for the
+    # full-year 2h extract and got a new id. With the old id here,
+    # transform.latest_paths() labelled the file "query_7804264" instead of
+    # "reserve_config", so any lookup by the real name missed it.
+    "7804264": "reserve_config",
     "7798339": "liquidation",
     "7798349": "flashloan",
     "7798351": "user_account",

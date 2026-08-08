@@ -683,13 +683,26 @@ def load_priorities(path=PRIORITY_PATH):
 
 def _save_priorities(scores, path=PRIORITY_PATH):
     """Write the map atomically (temp file + replace) so a concurrent reader in another
-    notebook never sees a half-written file."""
+    notebook never sees a half-written file.
+
+    Falls back to an in-place write when the rename is refused. Docker implements a
+    SINGLE-FILE bind mount by mounting that file's inode at the target path, and a
+    mount point cannot be renamed over — ``tmp.replace(path)`` raises
+    ``OSError: [Errno 16] Device or resource busy``. The fallback gives up
+    atomicity (a crash mid-write could truncate the file) but keeps the function
+    working inside a container; the atomic path is still used everywhere else.
+    """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
+    payload = {str(k): float(v) for k, v in scores.items()}
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({str(k): float(v) for k, v in scores.items()}, fh,
-                  indent=2, sort_keys=True)
-    tmp.replace(path)
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    try:
+        tmp.replace(path)
+    except OSError:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        tmp.unlink(missing_ok=True)
 
 
 def get_priorities(path=PRIORITY_PATH):

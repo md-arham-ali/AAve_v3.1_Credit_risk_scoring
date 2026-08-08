@@ -6,34 +6,6 @@ concrete, *decision-based* split functions. Each split is justified by statistic
 the row splits are built to be **balanced** — every piece holds ~1/3 of the rows, so
 no group dominates by sheer count.
 
-Two axes, kept deliberately distinct (no two umbrellas use the same signal):
-
-ROW-axis (segment the 4 380 time buckets into 3 balanced sub-frames)
-    * :func:`split_by_volatility_regime`   — umbrella 5: rolling volatility of net flow
-      (calm / normal / turbulent). A *dense* regime signal; the sparse, 72%-zero
-      ``market_stress_index`` can't be balanced-terciled, so it is used to VALIDATE
-      this split, not to build it.
-    * :func:`split_by_activity_intensity`  — umbrella 6: transaction COUNT per bucket
-      (quiet / active / peak). "How busy", independent of $ size.
-    * :func:`split_by_whale_dominance`     — umbrella 7: average transaction SIZE
-      (turnover / count) (retail / mixed / whale). "How concentrated", independent
-      of how busy.
-
-COLUMN-axis (group the 95 feature columns)
-    * :func:`split_columns_by_correlation` — umbrella 2: co-movement clustering
-      (which columns are redundant / move together).
-    * :func:`split_columns_by_tail_risk`   — umbrella 3: heavy-tail / volatility tier
-      (stable / moderate / wild), from per-column kurtosis, Hill index, robust CV.
-    * :func:`split_columns_by_stat`        — split columns into TWO frames by one
-      ``STAT_COLS`` statistic about a user threshold (the stat is read from the
-      ``adv_validation`` profile, computed there); :func:`column_band_matrix` bands
-      across all stats at once.
-
-Each function returns a small result dict so the notebook can show the signal,
-the labels, the balance, and the resulting pieces. Proof helpers
-(:func:`split_balance`, :func:`group_stat_table`, :func:`cluster_coherence`,
-:func:`column_group_profile`) produce the before/after evidence tables.
-
 Libraries imported by this module:
     pandas, numpy          -> framing, quantile binning
     EDA                    -> rolling_volatility, correlation_clusters, per-column

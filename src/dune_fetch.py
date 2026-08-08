@@ -36,7 +36,8 @@ def load_api_key(dotenv_path=None):
     return api_key
 
 
-def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=100000, save=True):
+def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=100000,
+                      save=True, table_name=None):
     """Fetch a Dune query's latest result as a DataFrame and save it to a CSV.
 
     This reads the query's most recent stored results — it does NOT re-run the
@@ -48,6 +49,13 @@ def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_li
         save_dir:   folder for the CSV (created if missing).
         page_limit: rows fetched per API page.
         save:       set False to skip writing the CSV.
+        table_name: filename prefix, e.g. "reserve_config" ->
+                    reserve_config_<id>_<stamp>.csv. Defaults to the generic
+                    "query_result_data" prefix. The prefix is cosmetic to the
+                    downstream parsers (transform._NAME_RE and
+                    data_validation.table_name_from_path both read the id out of
+                    the `_<id>_<stamp>` tail), but a readable name makes the
+                    folder scannable by eye.
 
     Returns:
         (dataframe, csv_path)  -- csv_path is None when save=False.
@@ -94,7 +102,8 @@ def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_li
         folder = Path(save_dir)
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        csv_path = folder / f"query_result_data_{query_id}_{stamp}.csv"
+        prefix = table_name or DEFAULT_SAVE_DIR
+        csv_path = folder / f"{prefix}_{query_id}_{stamp}.csv"
         df.to_csv(csv_path, index=False)
 
     return df, csv_path
