@@ -1,0 +1,43 @@
+# Everything here is EXCLUDED from the build context (never uploaded to the
+# Docker daemon). Data dirs are bind-mounted at run time instead, so they must
+# not be baked into images.
+
+.git/
+.git_broken_blobs_backup/
+.gitignore
+.dockerignore
+
+# Virtualenvs — containers build their own environment
+.venv/
+.venv-ge/
+venv/
+
+# Secrets never get baked into an image layer (they'd be extractable forever).
+# Injected at run time via docker-compose's env_file instead.
+.env
+.env.local
+
+# Generated data — bind-mounted at run time, not copied in
+query_result_data/
+transformed_data/
+validation_results/
+model_results/
+processed_data/
+mlflow_data/
+runs/
+
+# Python cruft.
+# NOTE: .dockerignore patterns are NOT .gitignore patterns — they only match at
+# the top level unless prefixed with **/. `__pycache__/` alone silently matches
+# nothing here, letting src/__pycache__ into the image.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.ipynb_checkpoints
+**/.pytest_cache
+
+# Not needed by the pipeline images
+.DS_Store
+frontend/
+backend/
+context/

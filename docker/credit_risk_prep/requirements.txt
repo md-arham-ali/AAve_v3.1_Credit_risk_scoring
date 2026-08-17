@@ -1,0 +1,18 @@
+# credit-risk-prep — on top of aave-core (pandas/numpy/papermill already there).
+#
+# scikit-learn is needed for exactly ONE import: model_split.py does
+#     from sklearn.model_selection import TimeSeriesSplit
+# which walk_forward_indices() uses to generate the expanding-window CV fold
+# boundaries. Pinned to the same version as the model stage so a fold computed
+# here matches one computed there. (scipy comes in as a sklearn dependency;
+# pinned explicitly for reproducibility.)
+#
+# Deliberately ABSENT: xgboost, lightgbm, lifelines, torch. Assembling and
+# splitting the table needs none of them — they belong to credit-risk-model,
+# which is why the two stages are separate images. torch alone is ~2 GB.
+scikit-learn==1.9.0
+scipy==1.18.0
+
+# matplotlib: model_features.ipynb plots, and adv_validation's diagnostic helpers
+# import it even when called with plot=False.
+matplotlib==3.10.7

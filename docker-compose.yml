@@ -1,0 +1,185 @@
+# Aave V3.1 pipeline — one service per stage.
+#
+# The shared base image must be built FIRST (Compose does not resolve
+# `FROM aave-core:latest` ordering between services):
+#   docker build -t aave-core:latest -f docker/base/Dockerfile .
+#
+# Then run any stage to completion:
+#   docker compose run --rm <service>
+#
+# Every service bind-mounts ./src, so host edits take effect with no rebuild.
+
+name: aave-v31
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Not a pipeline stage. Builds the shared base image and doubles as a shell
+  # for poking at src/ inside a container:
+  #   docker compose run --rm core                      # runs the self-test CMD
+  #   docker compose run --rm core bash                 # interactive shell
+  #   docker compose run --rm core python -c "import EDA; print(EDA.__file__)"
+  # ---------------------------------------------------------------------------
+  core:
+    image: aave-core:latest
+    build:
+      context: .
+      dockerfile: docker/base/Dockerfile
+    working_dir: /app
+    volumes:
+      # live-mount: /app/src IS the host ./src — edits are visible immediately
+      - ./src:/app/src:rw
+      # domain configs, for poking at one explicitly. NOT on this service's
+      # PYTHONPATH — `import model_config` must still fail here, proving the
+      # shared base cannot reach domain settings. Add the path by hand to inspect:
+      #   docker compose run --rm core python -c \
+      #     "import sys; sys.path.insert(0,'/app/domains/credit_risk'); import model_config"
+      - ./domains:/app/domains:ro
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1 — extraction: fetch Dune query results, then normalize raw units.
+  #   docker compose run --rm extraction
+  # ---------------------------------------------------------------------------
+  extraction:
+    image: aave-extraction:latest
+    build:
+      context: .
+      dockerfile: docker/extraction/Dockerfile
+    working_dir: /app
+    environment:
+      # Only the key is injected. The 16 query ids are hardcoded in
+      # process.ipynb cell 2, and their names start with digits, which are not
+      # valid environment-variable names — so `env_file: .env` is avoided here.
+      # `:?` makes Compose fail fast with a clear message if it's unset, rather
+      # than starting a container that dies mid-fetch.
+      DUNE_API_KEY: ${DUNE_API_KEY:?set DUNE_API_KEY in .env (no spaces around =)}
+    volumes:
+      - ./src:/app/src:rw
+      - ./notebooks:/app/notebooks:rw
+      # this stage's OUTPUT — fetched CSVs land in the host folder
+      - ./query_result_data:/app/query_result_data:rw
+      # executed notebooks (papermill output) — the run record for this stage
+      - ./runs:/app/runs:rw
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 — validation + transformation (merged: the two are interleaved in the
+  # code — transform.ipynb runs adv_validation's tier checks on its own output,
+  # and validation.ipynb validates the frames transform builds).
+  # Runs transform -> feature_addition -> validation. See run.sh for why.
+  #   docker compose run --rm validate-transform
+  # ---------------------------------------------------------------------------
+  validate-transform:
+    image: aave-validate-transform:latest
+    build:
+      context: .
+      dockerfile: docker/validate_transform/Dockerfile
+    working_dir: /app
+    volumes:
+      - ./src:/app/src:rw
+      - ./notebooks:/app/notebooks:rw
+      # INPUT, read-only: neither transform.py nor validation writes here
+      # (transform.py's SOURCE_DIR is read-only by design). :ro makes that a
+      # guarantee the filesystem enforces, not just a convention.
+      - ./query_result_data:/app/query_result_data:ro
+      # OUTPUTS
+      - ./transformed_data:/app/transformed_data:rw
+      - ./validation_results:/app/validation_results:rw
+      - ./processed_data:/app/processed_data:rw
+      # EDA.py resolves this to /app/column_priority.json (parent.parent of
+      # src/EDA.py). Mounted as a single FILE so priority edits persist to the
+      # real repo instead of dying with the container.
+      - ./column_priority.json:/app/column_priority.json:rw
+      - ./runs:/app/runs:rw
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3a — credit-risk-prep: shared panel -> split modelling table.
+  # First of the two DOMAIN-SPECIFIC boxes. Carries no ML libraries: assembling
+  # and splitting needs neither sklearn nor torch.
+  #   docker compose run --rm credit-risk-prep
+  # ---------------------------------------------------------------------------
+  credit-risk-prep:
+    image: aave-credit-risk-prep:latest
+    build:
+      context: .
+      dockerfile: docker/credit_risk_prep/Dockerfile
+    working_dir: /app
+    volumes:
+      - ./src:/app/src:rw
+      # the domain config, live-mounted like src/ — edit model_config.py and the
+      # next run picks it up. :ro because a stage should never rewrite its config.
+      - ./domains/credit_risk:/app/domains/credit_risk:ro
+      - ./notebooks:/app/notebooks:rw
+      # INPUT + OUTPUT are the same folder here: reads DF_common_final_1 /
+      # DF_liq_features_24h / DF_user_features_24h, writes DF_model_{train,val,test}
+      # + model_split_meta.json, so it cannot be :ro.
+      - ./transformed_data:/app/transformed_data:rw
+      # model_features.ipynb runs adv_validation profiles
+      - ./validation_results:/app/validation_results:rw
+      # model_dataset.sync_priorities() writes the tiered weights here
+      - ./column_priority.json:/app/column_priority.json:rw
+      - ./runs:/app/runs:rw
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3b — credit-risk-model: train the zoo, blend the PRI, read results back.
+  # The heavy box (sklearn/xgboost/lightgbm/lifelines/torch) — the only one that
+  # needs any of it, which is the whole point of splitting per stage.
+  #   docker compose run --rm credit-risk-model
+  #
+  # Re-read results WITHOUT retraining (model_results.ipynb fits nothing):
+  #   docker compose run --rm credit-risk-model papermill \
+  #     /app/notebooks/model_results.ipynb /app/runs/results_adhoc.ipynb \
+  #     -k python3 --cwd /app
+  # ---------------------------------------------------------------------------
+  credit-risk-model:
+    image: aave-credit-risk-model:latest
+    build:
+      context: .
+      dockerfile: docker/credit_risk_model/Dockerfile
+    working_dir: /app
+    volumes:
+      - ./src:/app/src:rw
+      - ./domains/credit_risk:/app/domains/credit_risk:ro
+      - ./notebooks:/app/notebooks:rw
+      # INPUT, read-only: reads DF_model_{train,val,test}.csv +
+      # model_split_meta.json (via model_persistence.load_model_data) and
+      # DF_model_dataset_24h.csv. Writes nothing here — credit-risk-prep owns
+      # this folder, so :ro enforces the stage boundary.
+      - ./transformed_data:/app/transformed_data:ro
+      # OUTPUT: ~60 metric JSONs + prediction CSVs, pri_timeseries.csv,
+      # run_manifest.json. Path comes from the domain's MODEL_RESULTS_DIR, so a
+      # second domain must change that value or it would overwrite these.
+      - ./model_results:/app/model_results:rw
+      - ./runs:/app/runs:rw
+      # backfill only — the one-off script plus the preserved historical runs it
+      # replays into MLflow. :ro because backfilling must never alter the archive.
+      - ./scripts:/app/scripts:ro
+      - ./model_results_20260721_70-15-15:/app/model_results_20260721_70-15-15:ro
+      - ./model_results_20260729_55-25-25:/app/model_results_20260729_55-25-25:ro
+    environment:
+      # Compose's internal DNS resolves the service name `mlflow` to that
+      # container. The tracking server must be up first:
+      #   docker compose up -d mlflow
+      # src/mlflow_tracking.py degrades to a no-op if this is unreachable, so a
+      # training run never fails just because tracking is down.
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MLFLOW_EXPERIMENT: credit_risk
+
+  # ---------------------------------------------------------------------------
+  # MLflow tracking server — the only LONG-RUNNING service. Everything else is
+  # run-to-completion; this one stays up serving the UI on localhost:5000.
+  #   docker compose up -d mlflow     # start
+  #   docker compose logs -f mlflow   # watch
+  #   docker compose down             # stop
+  # ---------------------------------------------------------------------------
+  mlflow:
+    image: aave-mlflow:latest
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    ports:
+      # host:container — open http://localhost:5000 in a browser
+      - "5001:5001"
+    volumes:
+      # Both the SQLite run database and every logged artifact live here, on
+      # your disk. Delete this folder and you delete all tracking history.
+      - ./mlflow_data:/mlflow:rw

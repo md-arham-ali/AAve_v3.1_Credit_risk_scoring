@@ -1,0 +1,13 @@
+# Shared base deps — installed once, inherited by every stage image.
+# Stage-specific heavy deps (great_expectations, sklearn/xgboost/torch, mlflow)
+# live in docker/<stage>/requirements.txt so a bump in one can't affect another.
+
+# Pinned to the versions that actually produced the current model_results/.
+# (requirements.txt leaves pandas unpinned; installing lifelines re-pins it to
+# 2.x anyway, so pin explicitly rather than let a fresh resolve pick 3.x.)
+pandas==2.3.3
+numpy==1.26.4
+
+# Notebook execution — every pipeline stage runs its notebooks headlessly
+papermill==2.6.0
+ipykernel==7.2.0

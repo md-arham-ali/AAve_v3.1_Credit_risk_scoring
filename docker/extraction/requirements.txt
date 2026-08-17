@@ -1,0 +1,4 @@
+# Extraction stage — on top of aave-core (pandas/numpy/papermill already there).
+# Only what dune_fetch.py adds: the HTTP call and .env reading.
+requests==2.33.1
+python-dotenv==1.1.1

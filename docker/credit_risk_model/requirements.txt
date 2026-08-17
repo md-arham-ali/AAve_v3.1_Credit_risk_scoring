@@ -1,0 +1,34 @@
+# credit-risk-model — the heavy stage, on top of aave-core.
+#
+# This is the one box that justifies the per-stage dependency split: everything
+# below is needed ONLY here. extraction, validate-transform and credit-risk-prep
+# carry none of it.
+#
+# pandas pinned again deliberately. lifelines declares pandas<3.0, so pip is free
+# to move pandas while resolving it; repeating the base image's exact pin makes
+# the resolution deterministic instead of leaving it to pip's discretion.
+pandas==2.3.3
+
+# model_zoo's registry + model_evaluation's metrics
+scikit-learn==1.9.0
+scipy==1.18.0
+xgboost==3.3.0
+lightgbm==4.6.0
+
+# run_cox: CoxPHFitter + concordance_index. model_config gates on
+# LIFELINES_AVAILABLE, so its absence would silently skip the survival model
+# rather than fail — pin it so that never happens by accident.
+lifelines==0.30.3
+
+# run_lstm / run_transformer. On arm64 Linux the PyPI wheel is CPU-only (CUDA
+# builds are x86_64), so no special index is needed here. Building this image for
+# an x86_64 host WOULD pull ~2.5 GB of unused CUDA libraries — use
+# --index-url https://download.pytorch.org/whl/cpu at that point.
+torch==2.12.1
+
+# model_results.ipynb plots the aggregated feature-importance bar chart
+matplotlib==3.10.7
+
+# MLflow CLIENT (the server runs in its own container from docker/mlflow/).
+# Same pin as the server so client and backend agree on the schema.
+mlflow==2.22.0

@@ -1,0 +1,11 @@
+# Validation + transformation stage — on top of aave-core.
+#
+# Great Expectations is the only heavy add. Its `pandas<2.2` cap applies ONLY to
+# the clickhouse/snowflake extras (not installed), so on Python 3.12 it just
+# needs pandas>=1.3.0 and coexists with the base's pinned pandas 2.3.3.
+great_expectations==0.18.22
+
+# adv_validation.negative_value_check / range_check / deviation_score import
+# matplotlib lazily for their plots. Notebook cells call them with plot=False,
+# but the import still has to resolve.
+matplotlib==3.10.7
