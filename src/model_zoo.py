@@ -1,10 +1,4 @@
-"""Modeling stage — the model zoo: registry, tuning grids, build + score helpers.
-
-Declarative registry of the 11 classifiers and 9 regressors (house defaults +
-small walk-forward tuning grids) plus the factory and the score helpers
-(``build_model``, ``predict_scores``, ``score_is_probability``, ``_xgb_overrides``).
-Consumed by model_evaluation (CV/tuning) and model_training (fitting).
-"""
+"""Modeling stage — model registry, tuning grids, and build/score helpers."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -129,12 +123,14 @@ REGRESSOR_GRIDS = {
 
 def build_model(name, kind="classifier", **overrides):
     """Instantiate a registry model with house defaults (+ tuned overrides)."""
+    # every spec gets RANDOM_STATE where it accepts one, so runs are reproducible
     specs = CLASSIFIER_SPECS if kind == "classifier" else REGRESSOR_SPECS
     return specs[name]["factory"](**overrides)
 
 
 def _xgb_overrides(y_train):
     """scale_pos_weight = n_neg / n_pos computed from the TRAIN labels."""
+    # NOTE: xgboost renames params between majors — this is the compatibility shim
     pos = int(np.sum(y_train))
     neg = int(len(y_train) - pos)
     return {"scale_pos_weight": (neg / pos) if pos else 1.0}
@@ -142,11 +138,8 @@ def _xgb_overrides(y_train):
 
 def predict_scores(model, X, X_train=None):
     """Probability-like score in [0, 1] for any classifier.
-
-    predict_proba when available; otherwise the decision_function rank-normalized
-    against the TRAIN decision scores (comparable across splits — not the previous
-    within-split ranks). Callers must treat rank scores as uncalibrated.
-    """
+    model, X, plus TRAIN decision scores for the rank-normalize fallback.
+    Returns: np.ndarray in [0, 1] — uncalibrated when predict_proba is absent."""
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
     raw = model.decision_function(X)
@@ -156,4 +149,5 @@ def predict_scores(model, X, X_train=None):
 
 def score_is_probability(model):
     """True when the model emits calibrated-ish probabilities (Brier meaningful)."""
+    # gates the Brier metric; rank scores must not be scored as probabilities
     return hasattr(model, "predict_proba")

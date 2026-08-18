@@ -1,15 +1,7 @@
 """Reusable data-validation checks for the Aave V3.1 Dune result tables.
 
-Flow per table:
-  1. pandas checks first  -> null counts, dtypes, duplicates  
-  2. Great Expectations   -> structural expectations           (tp be run after step 1)
-
-The checks are column-aware: each expectation is only added when the columns it
-needs are present, so the SAME functions work across the different tables.
-Libraries imported:
-    pandas              -> dataframes + the basic null/type/duplicate checks
-    great_expectations  -> the expectation suite 
-    re, datetime, pathlib -> standard library
+Per table: pandas checks first (nulls, dtypes, duplicates), then the Great
+Expectations suite. Column-aware — an expectation is only added when its columns exist.
 """
 
 import re
@@ -23,10 +15,8 @@ TABLE_LABELS = {
     "7702138": "supply_withdraw",
     "7798273": "borrow_repay",
     "7711042": "reserve_state_rates",
-    # 7804264, not the pre-E20 7798416: reserve_config was re-run for the
-    # full-year 2h extract and got a new id. With the old id here,
-    # transform.latest_paths() labelled the file "query_7804264" instead of
-    # "reserve_config", so any lookup by the real name missed it.
+    # 7804264, not the pre-E20 7798416 — reserve_config was re-run for the full-year
+    # 2h extract and got a new id, which broke lookup by real name in transform.latest_paths().
     "7804264": "reserve_config",
     "7798339": "liquidation",
     "7798349": "flashloan",
@@ -39,11 +29,10 @@ TABLE_LABELS = {
 ADDRESS_COLS = ("asset", "collateral_asset", "debt_asset")
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+# --- helpers ---
 def table_name_from_path(path):
     """Derive a short, table-specific name from a query_result_data_<id>_<ts>.csv file."""
+    # reads the query id out of the _<id>_<stamp> tail, so the prefix can be anything
     stem = Path(path).stem
     match = re.search(r"_(\d+)_", stem)
     qid = match.group(1) if match else stem
@@ -52,11 +41,13 @@ def table_name_from_path(path):
 
 def load_csv(path):
     """Read a result CSV. Values are left as-loaded (time_bucket/asset stay strings)."""
+    # default dtypes on purpose — big-int columns must stay strings here
     return pd.read_csv(path)
 
 
 def key_columns(df):
     """Best-effort composite key used for the uniqueness check."""
+    # column-aware: only the keys actually present come back
     cols = set(df.columns)
     if "time_bucket" in cols:
         if "asset" in cols:
@@ -81,18 +72,10 @@ def required_columns(df):
 
 def canonicalize_keys(df, time_col="time_bucket", asset_col="asset"):
     """Rewrite a frame's join keys to the model-ready (transformed-frame) convention.
+    df, time_col, asset_col -> time_bucket as "YYYY-MM-DD HH:MM:SS.fff UTC", asset as lower hex.
+    Returns: a NEW frame. Column-aware and idempotent."""
 
-    The transformed frames (``DF_common_1`` / ``DF_common_final``) store
-    ``time_bucket`` as a tz-explicit ``"YYYY-MM-DD HH:MM:SS.fff UTC"`` string and
-    ``asset`` as a lower-case hex address. Raw extracts such as ``reserve_config``
-    store ``time_bucket`` as a plain ``"YYYY-MM-DD HH:MM:SS"`` (no ``UTC`` suffix),
-    so a string-keyed merge silently misses every row. This normalizes the keys to
-    that canonical convention so a plain ``merge(on=[time_col, asset_col])`` lines up.
-
-    Returns a NEW frame (the input is not mutated). Column-aware (acts only on the
-    keys that are present) and idempotent — re-formatting an already-canonical key
-    yields the same string.
-    """
+    # raw extracts store a plain "YYYY-MM-DD HH:MM:SS", so a string-keyed merge misses every row
     out = df.copy()
     if time_col in out.columns:
         ts = pd.to_datetime(
@@ -116,11 +99,10 @@ def _expected_kind(col):
     return "any"
 
 
-# --------------------------------------------------------------------------- #
-# Step 1 — pandas basic checks (run first)
-# --------------------------------------------------------------------------- #
+# --- step 1: pandas basic checks (run first) ---
 def pandas_report(df, table_name):
     """Return (summary_df, null_counts_df) — the basic NULL/duplicate report."""
+    # step 1 — run this before the GE suite
     n_rows, n_cols = df.shape
     key = key_columns(df)
 
@@ -167,9 +149,7 @@ def type_report(df, table_name):
     return pd.DataFrame(rows)
 
 
-# --------------------------------------------------------------------------- #
-# Step 2 — Great Expectations checks (run after step 1)
-# --------------------------------------------------------------------------- #
+# --- step 2: Great Expectations checks ---
 def _add_expectations(gdf, df):
     """Register the column-aware basic expectations on a GE PandasDataset (GE 0.18 API)."""
     cols = set(df.columns)
@@ -203,6 +183,7 @@ def _add_expectations(gdf, df):
 
 def run_great_expectations(df, table_name):
     """Run the basic expectation suite (GE 0.18) and return a tidy results table."""
+    # step 2 — assumes pandas_report already ran
     import great_expectations as ge
 
     gdf = ge.from_pandas(df)                  # wrap the dataframe as a GE dataset
@@ -230,9 +211,7 @@ def run_great_expectations(df, table_name):
     return pd.DataFrame(rows)
 
 
-# --------------------------------------------------------------------------- #
-# Readable Markdown report
-# --------------------------------------------------------------------------- #
+# --- readable Markdown report ---
 def _df_to_md(df):
     """Render a DataFrame as a GitHub-flavored Markdown table (no extra dependencies)."""
     cols = [str(c) for c in df.columns]
@@ -278,11 +257,10 @@ def _table_block(table_name, summary, null_counts, types, ge_results):
     return "\n".join(parts)
 
 
-# --------------------------------------------------------------------------- #
-# Orchestration — pandas first, then GE
-# --------------------------------------------------------------------------- #
+# --- orchestration: pandas first, then GE ---
 def validate_table(df, table_name):
     """Run all checks for one table; return the frames + its Markdown block (no file write)."""
+    # pandas first, then GE; the report shows both
     summary, null_counts = pandas_report(df, table_name)   # step 1 (pandas)
     types = type_report(df, table_name)
     ge_results = run_great_expectations(df, table_name)     # step 2 (great expectations)
@@ -298,9 +276,8 @@ def validate_table(df, table_name):
 
 def validate_batch(paths, results_dir="validation_results", report_name="validation_report.md"):
     """Validate every table in `paths` and save ONE combined Markdown report.
-
-    Returns {report_path, overview (DataFrame), results (list of validate_table dicts)}.
-    """
+    paths, report dir.
+    Returns: {report_path, overview: DataFrame, results: [validate_table dicts]}."""
     out = Path(results_dir)
     out.mkdir(parents=True, exist_ok=True)
 

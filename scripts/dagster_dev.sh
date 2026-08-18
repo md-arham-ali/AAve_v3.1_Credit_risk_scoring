@@ -1,30 +1,19 @@
 #!/bin/bash
-# Start the Dagster UI + orchestrator LOCALLY.
+# Start the Dagster UI + orchestrator LOCALLY, in the FOREGROUND.
+#   ./scripts/dagster_dev.sh      — Ctrl+C stops it; leave the tab open.
+# Exists to export DAGSTER_HOME before startup: unset, `dagster dev` makes a throwaway
+# .tmp_dagster_home_<random>/ and deletes it on exit, so the materialization timeline
+# never accumulates. Storage is SQLite, Dagster's default, and needs no config.
 #
-#   ./scripts/dagster_dev.sh
-#
-# Why this script exists at all: `dagster dev` with DAGSTER_HOME unset silently
-# creates a throwaway .tmp_dagster_home_<random>/ in the working directory and
-# DELETES it on exit. Runs still get written to SQLite in there — they are just
-# thrown away when you Ctrl+C, so the materialization timeline (the main reason
-# assets beat plain tasks) never accumulates. Exporting the variable by hand
-# works but has to be redone in every new terminal, and exporting it AFTER the
-# server is already running does nothing — a process reads its environment once,
-# at startup. This script removes both failure modes.
-#
-# Runs in the FOREGROUND. This terminal becomes the server; leave the tab open.
-# Ctrl+C stops it.
-#
-# Storage is SQLite and needs no configuration — it is Dagster's default. The
-# only thing that was ever missing is a DAGSTER_HOME that outlives the process.
+# NOTE: exporting DAGSTER_HOME after the server is up does nothing — a process reads
+# its environment once, at startup.
 
 set -euo pipefail
 
 PORT=3000
 DEFS="orchestration/definitions.py"
 
-# Resolve the repo root from this script's own location, so the script works from
-# any working directory (same trick as scripts/mlflow_local.sh).
+# Repo root from the script's own location (same trick as scripts/mlflow_local.sh).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -63,9 +52,8 @@ fi
 
 mkdir -p "$DAGSTER_HOME"
 
-# A leftover temp home means a previous session ran without DAGSTER_HOME set.
-# Only mention it — it holds runs that are already orphaned, and deleting other
-# people's directories is not this script's job.
+# A leftover temp home means a previous session ran without DAGSTER_HOME set. Only
+# mention it — those runs are already orphaned, and deleting them isn't this script's job.
 for tmp in "$ROOT"/.tmp_dagster_home_*; do
   [ -d "$tmp" ] || continue
   echo "· note: leftover temp instance $(basename "$tmp") — from a run with"
@@ -91,8 +79,6 @@ echo "  Before materializing trained_models, start MLflow in another tab:"
 echo "    ./scripts/mlflow_local.sh"
 echo ""
 
-# --- run -------------------------------------------------------------------- #
-# `$PY -m dagster` rather than the .venv/bin/dagster wrapper: same interpreter
-# guarantee the assets rely on (they shell out via sys.executable), and immune to
-# the wrapper-shebang breakage this repo has already hit once.
+# `$PY -m dagster`, not the .venv/bin/dagster wrapper: same interpreter the assets shell
+# out to, and immune to the wrapper-shebang breakage this repo already hit once.
 exec "$PY" -m dagster dev -f "$DEFS" --port "$PORT"

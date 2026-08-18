@@ -1,11 +1,4 @@
-"""Fetch the latest stored result table of a Dune query and save it as a versioned CSV.
-
-Libraries imported by this module:
-    requests        -> the Dune HTTP API call
-    pandas          -> result table + CSV writing
-    python-dotenv   -> read DUNE_API_KEY from .env
-    os, pathlib, datetime, sys -> standard library
-"""
+"""Pull a Dune query's latest stored result table and save it as a versioned CSV."""
 
 import os
 import sys
@@ -22,11 +15,8 @@ DEFAULT_SAVE_DIR = "query_result_data"
 
 
 def load_api_key(dotenv_path=None):
-    """Read DUNE_API_KEY from the .env file into the environment and return it.
-
-    Call this once per session (the notebook's first cell does) to make the key
-    available to every later call. The key itself is never printed.
-    """
+    """Read DUNE_API_KEY from .env into the environment and return it.
+    Returns: the key string. Never printed. Call once per session."""
     load_dotenv(dotenv_path)
     api_key = os.getenv(ENV_KEY_NAME)
     if not api_key:
@@ -38,28 +28,11 @@ def load_api_key(dotenv_path=None):
 
 def fetch_query_table(query_id, api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=100000,
                       save=True, table_name=None):
-    """Fetch a Dune query's latest result as a DataFrame and save it to a CSV.
+    """Fetch a Dune query's latest stored result (no re-run, no credits spent).
+    query_id/api_key/save_dir/page_limit/save/table_name -> paged fetch + CSV write.
+    Returns: (DataFrame, csv_path); csv_path is None when save=False."""
 
-    This reads the query's most recent stored results — it does NOT re-run the
-    query, so it spends no execution credits. Large results are paged through fully.
-
-    Args:
-        query_id:   the numeric Dune query id (provided manually in the notebook).
-        api_key:    optional; falls back to load_api_key() / the environment.
-        save_dir:   folder for the CSV (created if missing).
-        page_limit: rows fetched per API page.
-        save:       set False to skip writing the CSV.
-        table_name: filename prefix, e.g. "reserve_config" ->
-                    reserve_config_<id>_<stamp>.csv. Defaults to the generic
-                    "query_result_data" prefix. The prefix is cosmetic to the
-                    downstream parsers (transform._NAME_RE and
-                    data_validation.table_name_from_path both read the id out of
-                    the `_<id>_<stamp>` tail), but a readable name makes the
-                    folder scannable by eye.
-
-    Returns:
-        (dataframe, csv_path)  -- csv_path is None when save=False.
-    """
+    # NOTE: table_name is cosmetic — transform._NAME_RE reads the id out of the tail.
     api_key = api_key or load_api_key()
     headers = {"X-Dune-Api-Key": api_key}
     url = f"{DUNE_API_BASE}/query/{query_id}/results"

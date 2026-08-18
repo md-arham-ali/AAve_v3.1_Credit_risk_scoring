@@ -1,58 +1,16 @@
 """Advanced, finance-aware Great Expectations checks for the Aave V3.1 result tables.
 
--This module adds *domain* expectations chosen for the kind of financial value each column holds:
-amounts, interest rates, liquidity indexes, basis-point configs, oracle prices,
-health factors and activity counts.
--Runs under `.venv-ge` (Great Expectations 0.18.x, pandas 2.x) — same kernel as
-`data_validation.py`.
+Domain expectations per value kind (amounts, rates, indexes, bps configs, oracle
+prices, health factors, counts), plus three standalone single-column diagnostics,
+the univariate pre-EDA profile (statistical_validation), and the Tier 0-4
+transformed-frame validators. Runs under .venv-ge (GE 0.18.x, pandas 2.x).
 
-The blockchain decimals problem (important)
--------------------------------------------
-Raw on-chain values are uint256 / int256 and arrive as plain integer STRINGS far
-larger than float64 can hold exactly (e.g. a RAY rate ~1e27, or the no-debt health
-factor sentinel 2**256-1, 78 digits). pandas/GE silently upcast such object columns
-to float64 during arithmetic, corrupting every digit below ~2**53. So:
-  * magnitude / range / shape checks stay in GE (the boundaries sit far from the
-    data, so float rounding cannot flip them), but
-  * every EXACT cross-column identity on big integers is computed in pure Python
-    `int` (`_to_int`), never with pandas object arithmetic.
-Those exact checks are reported next to the GE results, tagged `custom_*`.
-
-Single-column diagnostics (values + plots)
-------------------------------------------
-Besides the per-table suites, this module exposes three standalone, decimals-safe
-column checks that each take ``(df, column)`` and return a dict of values plus an
-optional matplotlib plot: ``negative_value_check`` (any negatives + how many),
-``range_check`` (in-bounds vs out-of-bounds), and ``deviation_score`` (per-row
-min-max score in [-1, 1]). matplotlib is imported lazily inside the plot helpers,
-so the value computations still work in environments without it.
-
-Statistical pre-EDA validation (univariate, finance-aware)
-----------------------------------------------------------
-``statistical_validation(df, table_name=None)`` profiles every numeric column with the
-descriptive statistics and data-quality flags that is to be settled *before* EDA:
-completeness (null %), zero-inflation, cardinality, robust location/scale (median, IQR,
-MAD), quantiles, dispersion (CV), distribution shape (skewness / excess kurtosis) and
-outlier counts (Tukey IQR fence + MAD modified z-score). It is deliberately univariate —
-no correlations, relationships, hypotheses or plots; that is EDA, not validation.
-Decimals-safe (uint256/RAY/WAD strings parsed exactly) and the 2**256-1 no-debt
-health-factor sentinel is counted then excluded so it can't distort the percentiles.
-Returns a tidy one-row-per-column frame, saved to
-``validation_results/<table>__stat_validation.csv``.
-
-Transformed-frame validation (model-ready frames, Tiers 0-4)
-------------------------------------------------------------
-``validate_transformed_final(df)`` and ``validate_reserve_panel(df)`` validate the two
-post-transform frames in ``transformed_data/`` against ``context/data_val.md``. Unlike the
-suites above (raw uint256 strings, GE), these frames are already scaled floats, so the
-checks are plain pandas/Python and return NUMERIC results — pass-rate %, counts, and the
-offending columns + ``time_bucket`` keys. Five per-tier functions (``tf_tier0_schema`` …
-``tf_tier4_temporal``) each return a one-row-per-check DataFrame so the notebook can show
-one tier per cell; the entry points concatenate them and save
-``validation_results/<frame>__transform_validation.csv``.
-
-To be scaled as required after addition of other feature tables.
+Decimals rule: magnitude/range/shape checks stay in GE (bounds sit far from the data,
+so float rounding cannot flip them); every EXACT cross-column identity on big integers
+is computed in pure Python int via _to_int and tagged custom_*.
 """
+
+# TODO: scale this out once the remaining feature tables land.
 
 import math
 import sys
@@ -67,9 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Reuse the loaders/keys already defined for the basic suite (no duplication).
 from data_validation import load_csv, table_name_from_path, key_columns, ADDRESS_COLS
 
-# --------------------------------------------------------------------------- #
-# Constants — on-chain fixed-point scales and shared formats
-# --------------------------------------------------------------------------- #
+# --- constants: on-chain fixed-point scales and shared formats ---
 RAY = 10 ** 27               # Aave rate/index fixed point (1.0 == 1e27)
 WAD = 10 ** 18               # Aave health-factor fixed point (1.0 == 1e18)
 UINT256_MAX = 2 ** 256 - 1   # health-factor sentinel for accounts with no debt
@@ -100,11 +56,10 @@ RESULT_COLS = ["table", "expectation", "column", "success",
                "element_count", "unexpected_count", "unexpected_percent", "note"] # to display a structured final result
 
 
-# --------------------------------------------------------------------------- #
-# Big-integer parsing (the decimals-safe primitives)
-# --------------------------------------------------------------------------- #
+# --- big-integer parsing (the decimals-safe primitives) ---
 def _to_int(v):
     """Parse one cell to a Python int (arbitrary precision) or None. Never floats."""
+    # pure Python int on purpose — pandas would upcast to float64 and lose the low digits
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
     if isinstance(v, bool):
@@ -124,14 +79,14 @@ def _to_int(v):
 
 def to_int_series(s):
     """Vectorless parse of a column to object-dtype Python ints (keeps None)."""
+    # object dtype in, exact ints out; never let this touch .astype(float)
     return s.map(_to_int)
 
 
 def _to_number(v):
-    """Parse one cell to a Python number or None — exact int for integer values,
-    float for decimals. Big integer STRINGS stay exact ints (decimals-safe), so this
-    works for both raw uint256 amount columns and ordinary float columns (prices/bps).
-    """
+    """Parse one cell to a Python number, or None.
+    Integer values stay exact ints (decimals-safe), decimals become floats.
+    Returns: int | float | None — works on raw uint256 columns and ordinary float columns alike."""
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, int):
@@ -150,9 +105,7 @@ def _to_number(v):
         return None
 
 
-# --------------------------------------------------------------------------- #
-# Result collector — wraps GE results and custom checks into one tidy table
-# --------------------------------------------------------------------------- #
+# --- result collector: wraps GE results and custom checks into one tidy table ---
 def _col_label(kw):
     if "column" in kw:
         return kw["column"]
@@ -210,11 +163,10 @@ class Checks:
         return all(n in self.cols for n in names)
 
 
-# --------------------------------------------------------------------------- #
-# Exact big-int finance checks (pure Python int — decimals-safe)
-# --------------------------------------------------------------------------- #
+# --- exact big-int finance checks (pure Python int — decimals-safe) ---
 def _net_flow_violations(raw, pos, neg, net):
     """net == coalesce(pos,0) - coalesce(neg,0); exact int (float would corrupt it)."""
+    # exact identity, so it runs in int space
     n = bad = 0
     for p, m, t in zip(raw[pos], raw[neg], raw[net]):
         ti = _to_int(t)
@@ -241,6 +193,7 @@ def _pair_le_violations(raw, small, big):
 
 def _monotonic_violations(raw, asset_col, time_col, value_col):
     """Per asset, index must never decrease over time (interest only accrues up)."""
+    # liquidity indexes only ever grow — a decrease means a bad extract
     sub = raw[[asset_col, time_col, value_col]].copy()
     sub["_v"] = sub[value_col].map(_to_int)
     sub = sub.sort_values([asset_col, time_col], kind="mergesort")  # time string sorts chronologically
@@ -262,11 +215,10 @@ def _symbol_consistency_violations(raw, asset_col, symbol_col):
     return int(per_asset.shape[0]), int((per_asset > 1).sum())
 
 
-# --------------------------------------------------------------------------- #
-# prepare() — build the frame GE validates against
-# --------------------------------------------------------------------------- #
+# --- prepare(): build the frame GE validates against ---
 def prepare(df):
     """Copies df, parse big-int columns to Python ints, and add count-partition helpers."""
+    # GE validates this frame, not the original — magnitudes only, no exact identities
     p = df.copy()
     for c in BIGINT_COLS & set(p.columns):
         p[c] = to_int_series(p[c])                       # decimals-safe ints for GE range checks
@@ -282,10 +234,9 @@ def prepare(df):
     return p
 
 
-# --------------------------------------------------------------------------- #
-# Common checks — applied to every table, column-aware
-# --------------------------------------------------------------------------- #
+# --- common checks: applied to every table, column-aware ---
 def common_expectations(chk):
+    # column-aware, so the same call works across every table
     cols = chk.cols
 
     chk.ge("table must not be empty", "expect_table_row_count_to_be_between", min_value=1)
@@ -332,9 +283,7 @@ def common_expectations(chk):
                    "custom_bigint_well_formed", c, n, bad)
 
 
-# --------------------------------------------------------------------------- #
-# Per-table suites (intermediate -> advanced, finance-specific)
-# --------------------------------------------------------------------------- #
+# --- per-table suites (intermediate -> advanced, finance-specific) ---
 def adv_supply_withdraw(chk):
     for c in ("supply_amount_raw", "withdrawal_amount_raw"):     # token amounts >= 0
         chk.ge("supplied/withdrawn amount >= 0", "expect_column_values_to_be_between",
@@ -396,12 +345,12 @@ def adv_reserve_state(chk):
                 n, bad = _monotonic_violations(chk.raw, "asset", "time_bucket", c)
                 chk.custom("index is monotonic non-decreasing per asset",
                            "custom_index_monotonic", c, n, bad)
-    # NOTE: variable_borrow_index >= liquidity_index is deliberately NOT asserted — it is
-    # false for borrowing-disabled collateral assets (e.g. sDAI), whose borrow index stays
-    # pinned at 1.0 RAY while the liquidity index still grows.
+    # NOT asserted: variable_borrow_index >= liquidity_index is false for borrowing-disabled
+    # collateral (e.g. sDAI), whose borrow index stays pinned at 1.0 RAY.
 
 
 def adv_reserve_config(chk):
+    # bps fields live on the 0-10000 scale here; normalization.py is what scales them
     for c in ("supply_cap", "old_supply_cap", "borrow_cap", "old_borrow_cap",
               "debt_ceiling", "old_debt_ceiling"):               # caps/ceilings >= 0
         if c in chk.cols:
@@ -459,6 +408,7 @@ def adv_flashloan(chk):
 
 
 def adv_user_account(chk):
+    # the 2**256-1 no-debt health factor is a sentinel, not an outlier
     for c in ("avg_total_collateral_base", "avg_total_debt_base",
               "avg_available_borrows_base"):                     # USD-base (8dp) >= 0
         if c in chk.cols:
@@ -511,6 +461,7 @@ def adv_collateral_toggle(chk):
 
 
 def adv_oracle_price(chk):
+    # NOTE: price decimals differ per feed — read them from the table, don't assume 8
     if "decimals" in chk.cols:                                  # token decimals sane (nulls ok)
         chk.ge("decimals in [0, 36]", "expect_column_values_to_be_between",
                column="decimals", min_value=0, max_value=36)
@@ -529,9 +480,7 @@ def adv_oracle_price(chk):
                column="price_points", min_value=1, max_value=6)
 
 
-# --------------------------------------------------------------------------- #
-# Dispatch — pick the suite by a column unique to each table
-# --------------------------------------------------------------------------- #
+# --- dispatch: pick the suite by a column unique to each table ---
 TABLE_SUITES = {
     "supply_withdraw": adv_supply_withdraw,
     "borrow_repay": adv_borrow_repay,
@@ -560,6 +509,7 @@ _SIGNATURES = [
 
 def detect_table(df):
     """Identify which table a frame is by a signature column; None if unrecognized."""
+    # keyed on a column unique to each table, so a renamed query id doesn't break it
     cols = set(df.columns)
     for sig, name in _SIGNATURES:
         if sig in cols:
@@ -567,18 +517,11 @@ def detect_table(df):
     return None
 
 
-# --------------------------------------------------------------------------- #
-# Entry point — run common + table-specific checks; return (and optionally save)
-# --------------------------------------------------------------------------- #
+# --- entry point: common + table-specific checks ---
 def validate_table_advanced(df, table_name=None, results_dir="validation_results", save=True):
-    """Run the advanced suite for one table and return a tidy results DataFrame.
-
-    Args:
-        df:          the result table as a pandas DataFrame (read with default dtypes).
-        table_name:  optional label; auto-detected from the columns when omitted.
-        results_dir: where the per-table CSV is written.
-        save:        set False to skip writing the CSV.
-    """
+    """Run the advanced suite for one table.
+    df, table_name (auto-detected from columns when omitted), results_dir, save.
+    Returns: a tidy results DataFrame; also writes the per-table CSV unless save=False."""
     name = table_name or detect_table(df) or "unknown"
     prepared = prepare(df)
 
@@ -600,14 +543,11 @@ def validate_table_advanced(df, table_name=None, results_dir="validation_results
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Single-column diagnostics — values + plots, decimals-safe, take (df, column)
-# --------------------------------------------------------------------------- #
+# --- single-column diagnostics: values + plots, decimals-safe, take (df, column) ---
 def _numeric_pairs(df, column):
-    """Return (indices, values) for non-null parseable cells of df[column].
-
-    Big-int strings stay exact Python ints; decimals parse to float (decimals-safe).
-    """
+    """Indices and values for the non-null parseable cells of df[column].
+    Big-int strings stay exact ints; decimals parse to float.
+    Returns: (indices, values)."""
     idx, vals = [], []
     for i, v in zip(df.index, df[column]):
         num = _to_number(v)
@@ -619,6 +559,7 @@ def _numeric_pairs(df, column):
 
 def _get_ax(ax):
     """Return a matplotlib Axes (lazy import — only needed when plotting)."""
+    # matplotlib imported lazily so the value checks still run without it
     import matplotlib.pyplot as plt
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 4))
@@ -627,11 +568,8 @@ def _get_ax(ax):
 
 def negative_value_check(df, column, plot=True, max_examples=10, ax=None):
     """Report negative values in df[column]: whether any exist and how many.
-
-    Decimals-safe (big-int strings parsed as exact Python ints, so a RAY rate or the
-    2**256-1 health-factor sentinel is never misread). Returns a dict of values; with
-    plot=True it also draws a non-negative vs negative count bar and adds it as 'ax'.
-    """
+    df, column, plot -> decimals-safe, so a RAY rate or the 2**256-1 sentinel is never misread.
+    Returns: dict of values; plot=True adds a count bar under 'ax'."""
     idx, vals = _numeric_pairs(df, column)
     n_checked = len(vals)
     negatives = [(i, v) for i, v in zip(idx, vals) if v < 0]
@@ -662,11 +600,8 @@ def negative_value_check(df, column, plot=True, max_examples=10, ax=None):
 def range_check(df, column, min_value=None, max_value=None, plot=True,
                 max_examples=10, ax=None):
     """Check df[column] lies within [min_value, max_value] (each bound optional).
-
-    With no bounds it just describes the observed range. Decimals-safe. Returns a dict
-    of values (counts below / above / within, observed min & max, offending examples);
-    with plot=True it draws a histogram with the bounds marked and adds it as 'ax'.
-    """
+    With no bounds it just describes the observed range. Decimals-safe.
+    Returns: dict (counts below/above/within, observed min & max, examples); plot=True adds 'ax'."""
     idx, vals = _numeric_pairs(df, column)
     n_checked = len(vals)
     below = [(i, v) for i, v in zip(idx, vals) if min_value is not None and v < min_value]
@@ -709,14 +644,11 @@ def range_check(df, column, min_value=None, max_value=None, plot=True,
 
 
 def deviation_score(df, column, plot=True, ax=None):
-    """Per-row min-max deviation score in [-1, 1]:  2*(x - min)/(max - min) - 1.
+    """Per-row min-max deviation score in [-1, 1]: 2*(x - min)/(max - min) - 1.
+    -1 = column min, +1 = max, 0 = midpoint; a constant column scores 0 everywhere.
+    Returns: dict with the per-row Series under 'scores'; plot=True adds a histogram as 'ax'."""
 
-    -1 = column minimum, +1 = column maximum, 0 = range midpoint; a constant column
-    scores 0 everywhere. Big integers are divided via Decimal then cast to float, so
-    the score stays accurate even on uint256 columns. Returns a dict of values with
-    the per-row scores under 'scores' (a pandas Series indexed like df); with plot=True
-    it draws a histogram of the scores and adds it as 'ax'.
-    """
+    # big integers divide via Decimal first, so the score holds up on uint256 columns
     idx, vals = _numeric_pairs(df, column)
     n_checked = len(vals)
 
@@ -761,11 +693,9 @@ def deviation_score(df, column, plot=True, ax=None):
     return result
 
 
-# --------------------------------------------------------------------------- #
-# Statistical pre-EDA validation — univariate profile + data-quality flags
-# --------------------------------------------------------------------------- #
-# Advisory thresholds (tunable). These raise FLAGS, not failures: heavy tails and
-# zero-inflation are normal for DeFi data, they just want noting before EDA.
+# --- statistical pre-EDA validation: univariate profile + data-quality flags ---
+# The thresholds below raise FLAGS, not failures — heavy tails and zero-inflation are
+# normal for DeFi data, they just want noting before EDA.
 NULL_FRAC_WARN = 0.20         # > 20% missing -> completeness concern
 ZERO_FRAC_WARN = 0.50         # > 50% zeros -> zero-inflated / sparse activity
 QUASI_CONSTANT_FRAC = 0.95    # one value covers > 95% of rows -> near-constant
@@ -801,12 +731,10 @@ def _finite(x):
 
 def _series_stats(s):
     """Robust + classical univariate stats for one sentinel-free float Series.
+    Median/IQR/MAD/quantiles lead; higher moments reported only when finite.
+    Returns: dict, with outliers counted two ways (Tukey IQR fence and MAD modified z)."""
 
-    Robust order statistics (median, IQR, MAD, quantiles) lead because DeFi amount and
-    rate columns are heavy-tailed, where a single whale row distorts mean/std. Higher
-    moments are float64 and reported only when finite. Outliers are counted two ways:
-    the Tukey IQR fence and the MAD-based modified z-score (both robust to fat tails).
-    """
+    # robust stats lead because one whale row distorts mean/std on these columns
     n = int(len(s))
     qs = s.quantile([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
     med = float(qs.loc[0.50])
@@ -840,6 +768,7 @@ def _series_stats(s):
 
 def _column_stats(df, column, table):
     """Profile one column; None for non-numeric (address/symbol/time/key) columns."""
+    # skips non-numeric columns (addresses, symbols, keys) rather than erroring
     from collections import Counter
 
     series = df[column]
@@ -905,34 +834,11 @@ def _column_stats(df, column, table):
 def statistical_validation(df, table_name=None, columns=None,
                            results_dir="validation_results", save=True):
     """Pre-EDA statistical profile + data-quality flags for every numeric column.
+    df, table_name, columns, results_dir, save -> completeness, zero-inflation, robust and
+    classical moments, quantiles, outlier counts. Returns: a tidy DataFrame (STAT_COLS)."""
 
-    A validation gate, not EDA: it answers "is each column fit to explore?" with
-    univariate descriptive statistics and flags only — no correlations, bivariate
-    relationships, hypotheses or plots. Tuned for financial / DeFi data:
-
-      * completeness (null %), zero-inflation (sparse activity) and cardinality,
-      * robust location/scale (median, IQR, MAD) plus mean/std/CV,
-      * quantiles p01/p05/q25/median/q75/p95/p99 and min/max,
-      * distribution shape (skewness, excess kurtosis) with a heavy-tail flag,
-      * outlier counts via the Tukey IQR fence and the MAD modified z-score.
-
-    Decimals-safe: uint256/RAY/WAD strings are parsed exactly via ``_to_number`` and the
-    2**256-1 no-debt health-factor sentinel is counted (``n_sentinel``) then excluded so
-    it can't distort the percentiles. The distribution moments themselves run in float64
-    (magnitude/shape only — never an exact identity), consistent with the rest of this
-    module. Non-numeric columns (addresses, symbols, time_bucket, keys) are skipped.
-
-    Args:
-        df:          the result table as a pandas DataFrame.
-        table_name:  optional label; auto-detected from the columns when omitted.
-        columns:     optional subset of columns to profile (default: all columns).
-        results_dir: where the per-table CSV is written.
-        save:        set False to skip writing the CSV.
-
-    Returns:
-        a tidy DataFrame, one row per numeric column (``STAT_COLS``); ``success`` is
-        False only for empty or zero-variance columns (everything else is advisory).
-    """
+    # a validation gate, not EDA: univariate only, no correlations or hypotheses.
+    # The 2**256-1 sentinel is counted as n_sentinel then excluded from the percentiles.
     name = table_name or detect_table(df) or "unknown"
     cols = list(df.columns) if columns is None else list(columns)
     rows = [r for r in (_column_stats(df, c, name) for c in cols) if r is not None]
@@ -946,19 +852,12 @@ def statistical_validation(df, table_name=None, columns=None,
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Transformed-frame validation (the model-ready frames in transformed_data/)
-# --------------------------------------------------------------------------- #
-# The two post-transform frames have a different grain/schema from the raw
-# query_result_data tables validated above, and are already scaled (no uint256
-# strings), so these checks use plain pandas/Python int — exact here — and return
-# tidy NUMERIC results (pass-rate %, counts, offending columns + time_buckets)
-# rather than GE objects. They implement context/data_val.md, Tiers 0-4:
-#   * DF_common_final — protocol-level 6h feature matrix; time_bucket is the PK.
-#   * DF_common_1     — asset-level reserve panel keyed on (time_bucket, asset).
-# One function per tier returns a DataFrame (one row per check); the per-tier
-# results carry tier / check / columns / severity / n_checked / n_pass / n_fail /
-# pass_rate_pct / anomaly_columns / anomaly_buckets / detail.
+# --- transformed-frame validation (the model-ready frames in transformed_data/) ---
+# Different grain from the raw tables and already scaled, so these use plain pandas/Python
+# int and return NUMERIC results (pass-rate %, counts, offending columns + time_buckets)
+# rather than GE objects. Implements context/data_val.md Tiers 0-4:
+#   DF_common_final — protocol-level 6h feature matrix, time_bucket is the PK
+#   DF_common_1     — asset-level reserve panel keyed on (time_bucket, asset)
 
 TRANSFORM_RESULT_COLS = [
     "tier", "check", "columns", "severity",
@@ -974,9 +873,7 @@ MAGNITUDE_JUMP_DEX = 1.0      # |Δlog10| >= this between consecutive buckets = 
 PRICE_SPREAD_TOL = 0.05       # cross-family implied-price spread tolerance (5%)
 
 
-# --------------------------------------------------------------------------- #
-# Tidy-result primitives (shared by every transformed-frame check)
-# --------------------------------------------------------------------------- #
+# --- tidy-result primitives (shared by every transformed-frame check) ---
 def _col_numbers(df, col):
     """Row-aligned list of parsed numbers (None for null / non-numeric), decimals-safe."""
     return [_to_number(v) for v in df[col]]
@@ -984,6 +881,7 @@ def _col_numbers(df, col):
 
 def _key_buckets(df, mask, key="time_bucket", cap=10):
     """(count, capped sample) of the key (or row index) where boolean mask is True."""
+    # time_bucket is the protocol-level PK; duplicates here invalidate every tier
     src = df[key] if key in df.columns else df.index
     hits = [k for k, m in zip(src, mask) if m]
     return len(hits), hits[:cap]
@@ -1046,11 +944,9 @@ def _monotonic_violations_num(df, asset_col, time_col, value_col):
     return n, bad
 
 
-# --------------------------------------------------------------------------- #
-# Consolidated scanners — one tidy row per logical check across many columns
-# (failures surface via anomaly_columns + per-offender counts in detail, so the
-# suite stays compact and a sub-100% pass rate is never buried in green noise).
-# --------------------------------------------------------------------------- #
+# --- consolidated scanners: one tidy row per logical check across many columns ---
+# Failures surface via anomaly_columns + per-offender counts, so a sub-100% pass rate
+# is never buried in green noise.
 def _scan_values(df, cols, is_bad):
     """Across cols, over non-null parsed values, count those failing is_bad(v).
     Returns (n_checked, n_bad, {col: bad_count} for offending cols only)."""
@@ -1124,9 +1020,7 @@ def _consolidated(tier, check, columns, n_checked, n_bad, off,
                      detail=detail if detail is not None else _offenders_str(off))
 
 
-# --------------------------------------------------------------------------- #
-# Tier 0 — Schema & type
-# --------------------------------------------------------------------------- #
+# --- Tier 0: schema & type ---
 def tf_tier0_schema(df):
     rows = []
     if "time_bucket" in df.columns:                              # tz-explicit timestamp (UTC)
@@ -1156,9 +1050,7 @@ def tf_tier0_schema(df):
     return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
 
 
-# --------------------------------------------------------------------------- #
-# Tier 1 — Univariate domain / range
-# --------------------------------------------------------------------------- #
+# --- Tier 1: univariate domain / range ---
 def tf_tier1_domain(df):
     rows = []
     nn = _count_like_cols(df) + _value_cols(df) + _avg_base_cols(df)
@@ -1171,9 +1063,8 @@ def tf_tier1_domain(df):
     rows.append(_consolidated("T1", "bps numeric bound [0, 10000]",
                               "avg_ltv, avg_current_liquidation_threshold", n, bad, off))
 
-    # HARD: bps fields must be on the bps SCALE. A populated value in (0, 1] is the silent
-    # bps->fraction conversion data_val.md says to catch — it slips past the [0, 10000] bound
-    # only because 0.79 < 10000. Count every fractional value as a unit violation.
+    # HARD: a populated bps value in (0, 1] is the silent bps->fraction conversion — it slips
+    # past the [0, 10000] bound only because 0.79 < 10000. Every fraction is a unit violation.
     n, bad, off = _scan_values(df, bps, lambda v: 0 < v <= 1.0)
     rows.append(_consolidated("T1", "bps fields on bps scale (not silently rescaled to fraction)",
                               "avg_ltv, avg_current_liquidation_threshold", n, bad, off,
@@ -1189,17 +1080,14 @@ def tf_tier1_domain(df):
     return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
 
 
-# --------------------------------------------------------------------------- #
-# Tier 2 — Intra-row logical invariants
-# --------------------------------------------------------------------------- #
+# --- Tier 2: intra-row logical invariants ---
 def _zero_coupling(df, anchor, amount_members, count_members, cap=10):
-    """count <=> amount <=> uniques per family.  Per row with the anchor present:
-         anchor == 0  =>  every member == 0
-         anchor  > 0  =>  every amount & unique member > 0
-    All-null rows (anchor and members all null) are NOT counted — they are the
-    'quiet bucket vs pipeline gap' case and are reported separately so a structural
-    zero is never confused with a missing row.
-    """
+    """count <=> amount <=> uniques coupling per family.
+    Per row with the anchor present: anchor == 0 => all members 0; anchor > 0 => all members > 0.
+    Returns: the tidy check row. All-null rows are excluded and reported separately."""
+
+    # that exclusion is the 'quiet bucket vs pipeline gap' distinction — a structural zero
+    # must never be confused with a missing row
     members = amount_members + count_members
     a = _col_numbers(df, anchor)
     M = {m: _col_numbers(df, m) for m in members}
@@ -1233,6 +1121,7 @@ def _zero_coupling(df, anchor, amount_members, count_members, cap=10):
 def _sampling_consistency(df, cap=10):
     """sampled_user_count == 0  =>  the avg_* aggregates must be null (not a 0 from /0).
     One consolidated row; offenders = avg_* columns that held a value at a zero-sample row."""
+    # state columns land in ~half the buckets — that is sampling, not a gap
     if "sampled_user_count" not in df.columns:
         return []
     s = _col_numbers(df, "sampled_user_count")
@@ -1334,9 +1223,7 @@ def tf_tier2_invariants(df):
     return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
 
 
-# --------------------------------------------------------------------------- #
-# Tier 3 — Unit & cross-asset consistency
-# --------------------------------------------------------------------------- #
+# --- Tier 3: unit & cross-asset consistency ---
 def _usd_eth_pairing(df, usd, eth, cap=10):
     """usd == 0 (or null) <=> eth == 0 (or null), over rows where either side is present."""
     u, e = _col_numbers(df, usd), _col_numbers(df, eth)
@@ -1352,6 +1239,7 @@ def _usd_eth_pairing(df, usd, eth, cap=10):
 
 def _implied_price_coherence(df, families, tol=PRICE_SPREAD_TOL, cap=10):
     """Per bucket, usd/eth across families should imply ~one ETH price (spread <= tol)."""
+    # cross-checks usd/eth against the oracle, catching a mis-scaled amount column
     cols = {f: (_col_numbers(df, f[0]), _col_numbers(df, f[1])) for f in families}
     mask = [False] * len(df)
     spreads = []
@@ -1376,12 +1264,13 @@ def _implied_price_coherence(df, families, tol=PRICE_SPREAD_TOL, cap=10):
 
 
 def _magnitude_stability(df, cols, dex=MAGNITUDE_JUMP_DEX, cap=10):
-    """avg_*_base base-unit stability. A decimals / base-unit change is a *persistent*
-    mid-series level shift, not bucket-to-bucket noise — and these averages legitimately
-    swing orders of magnitude on their own because the per-bucket sample is tiny. So this is
-    a series-level check: compare the median log10 of the first vs second half of the
-    time-ordered series and flag only a sustained shift of >= dex orders (one soft check per
-    column). The old per-bucket jump count fired on ordinary sampling variation (~50% FPs)."""
+    """avg_*_base base-unit stability, checked at SERIES level.
+    Compares median log10 of the first vs second half; flags a sustained shift of >= dex orders.
+    Returns: one soft check row per column."""
+
+    # series-level on purpose: a decimals change is a persistent level shift, while these
+    # tiny-sample averages swing orders of magnitude on their own (the old per-bucket jump
+    # count ran ~50% false positives).
     import statistics
     recs = []
     for c in cols:
@@ -1432,11 +1321,10 @@ def tf_tier3_consistency(df):
     return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
 
 
-# --------------------------------------------------------------------------- #
-# Tier 4 — Temporal integrity (time_bucket as the protocol-level primary key)
-# --------------------------------------------------------------------------- #
+# --- Tier 4: temporal integrity (time_bucket as the protocol-level primary key) ---
 def _full_6h_grid(start, end):
     """Every 6h boundary from start to end inclusive (as pandas Timestamps)."""
+    # TODO: hardcoded to the 6h grain; parameterize when the 2h panel gets its own tier 4
     from datetime import timedelta
     step, t, grid = timedelta(hours=1), start, []
     while t <= end:
@@ -1484,12 +1372,11 @@ def tf_tier4_temporal(df):
     return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
 
 
-# --------------------------------------------------------------------------- #
-# Entry points — run all tiers and (optionally) save one tidy CSV per frame
-# --------------------------------------------------------------------------- #
+# --- entry points: run all tiers and optionally save one tidy CSV per frame ---
 def validate_transformed_final(df, table_name="DF_common_final",
                                results_dir="validation_results", save=True):
     """Run Tiers 0-4 on the protocol-level feature matrix; return one tidy DataFrame."""
+    # protocol-level frame, time_bucket keyed
     out = pd.concat([tf_tier0_schema(df), tf_tier1_domain(df), tf_tier2_invariants(df),
                      tf_tier3_consistency(df), tf_tier4_temporal(df)], ignore_index=True)
     if save:
@@ -1504,6 +1391,7 @@ def validate_reserve_panel(df, table_name="DF_common_1",
     """Applicable subset of data_val.md for the asset-level reserve panel
     (composite-PK uniqueness, time schema/grid, rate/index non-negativity, index>=1.0
     and per-asset index monotonicity). Returns one tidy DataFrame."""
+    # asset-level frame, keyed on (time_bucket, asset)
     rows = []
     if {"time_bucket", "asset"} <= set(df.columns):
         dup = df.duplicated(subset=["time_bucket", "asset"], keep=False).tolist()

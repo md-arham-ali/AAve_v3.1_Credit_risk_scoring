@@ -1,17 +1,7 @@
-"""Controlled, statistics-driven splits of the protocol-level feature panel.
+"""Statistics-driven splits of the protocol-level feature panel (DF_common_final_1).
 
-This module turns the "split umbrellas" brainstormed for ``DF_common_final_1`` into
-concrete, *decision-based* split functions. Each split is justified by statistics
-(computed with :mod:`adv_validation` and :mod:`EDA`) rather than by eyeballing, and
-the row splits are built to be **balanced** — every piece holds ~1/3 of the rows, so
-no group dominates by sheer count.
-
-Libraries imported by this module:
-    pandas, numpy          -> framing, quantile binning
-    EDA                    -> rolling_volatility, correlation_clusters, per-column
-                             tail metrics (excess kurtosis / Hill / robust CV)
-    adv_validation         -> full robust per-column profile (statistical_validation)
-                             for the deeper before/after evidence table
+Each split is justified by statistics from adv_validation / EDA rather than by eye,
+and every row split is equal-count balanced — no piece dominates by sheer count.
 """
 
 import numpy as np
@@ -35,29 +25,15 @@ VOLUME_COL = "protocol_turnover_usd"     # umbrella 7 — $ throughput (numerato
 
 def numeric_columns(df, exclude=(TIME_COL,)):
     """Numeric feature columns, excluding the time key."""
+    # time key excluded — it is a string in these frames anyway
     return [c for c in df.select_dtypes("number").columns if c not in exclude]
 
 
-# --------------------------------------------------------------------------- #
-# Per-column statistic resolver — the bridge that makes column splits generic
-# --------------------------------------------------------------------------- #
+# --- per-column statistic resolver: the bridge that makes column splits generic ---
 def column_stat_series(df, stat, stats=None, columns=None, stat_col="column"):
     """Resolve ANY per-column statistic into a Series indexed by column name.
-
-    ``stat`` may be any of:
-      * a ``pd.Series`` / ``dict``  -> ``{column: value}`` used as-is;
-      * a callable ``f(df, column) -> float``  -> evaluated per column;
-      * a ``str`` naming a column of the ``stats`` profile table (e.g. ``"cv"``,
-        ``"skewness"``, ``"p95"``) -> read straight from that table;
-      * a ``str`` naming a function in :mod:`EDA` (e.g. ``"gini_coefficient"``,
-        ``"hill_tail_index"``, ``"sharpe_ratio"``) -> ``EDA.<stat>(df, column)`` per
-        column.
-
-    This is what makes the column splits work for ANY statistic — whether it already
-    lives in an ``adv_validation.statistical_validation`` profile or is computed on the
-    fly from :mod:`EDA`. A ``str`` is looked up in ``stats`` first (cheaper, already
-    computed), then in :mod:`EDA`.
-    """
+    stat: Series/dict, callable(df, col), a `stats` profile column, or an EDA function name.
+    Returns: pd.Series[column -> float]. A str is looked up in `stats` first, then in EDA."""
     if isinstance(stat, pd.Series):
         return stat.astype("float64")
     if isinstance(stat, dict):
@@ -79,12 +55,9 @@ def column_stat_series(df, stat, stats=None, columns=None, stat_col="column"):
 
 
 def _band_series(s, thresholds, labels):
-    """Label each value of ``s`` with a band: quantile (thresholds=None) or fixed cuts.
-
-    ``thresholds=None`` -> equal-count ``pd.qcut`` into ``len(labels)`` bands. Otherwise
-    fixed, left-closed ``pd.cut`` edges ``[-inf, *thresholds, inf]`` (value on an edge ->
-    higher band); ``len(thresholds)`` must be ``len(labels) - 1``.
-    """
+    """Label each value of `s` with a band.
+    thresholds=None -> equal-count qcut; otherwise left-closed cut on [-inf, *thresholds, inf].
+    Returns: Categorical Series. len(thresholds) must be len(labels) - 1."""
     if thresholds is None:
         return pd.qcut(s, len(labels), labels=list(labels), duplicates="drop")
     if len(thresholds) != len(labels) - 1:
@@ -93,21 +66,11 @@ def _band_series(s, thresholds, labels):
     return pd.cut(s, bins=edges, labels=list(labels), right=False)
 
 
-# --------------------------------------------------------------------------- #
-# Shared row-split engine — one balanced tercile cut, reused by 5 / 6 / 7
-# --------------------------------------------------------------------------- #
+# --- shared row-split engine: one balanced tercile cut, reused by umbrellas 5 / 6 / 7 ---
 def _tercile_split(df, score, labels, signal_name):
-    """Cut ``df`` into 3 balanced row groups by ``score`` (equal-count terciles).
-
-    ``pd.qcut`` makes the three groups equal-count by construction (requirement:
-    no weight difference between pieces). Rows whose score is NaN (e.g. the leading
-    buckets of a rolling signal) are left unlabeled and excluded from every piece;
-    the count is reported in the result as ``n_unlabeled``.
-
-    Returns a dict: ``signal_name``, ``score`` (Series), ``labels`` (Categorical
-    Series aligned to ``df.index``), ``cutpoints`` (the tercile edges), ``frames``
-    ({label: sub-DataFrame}), and ``n_unlabeled``.
-    """
+    """Cut `df` into 3 equal-count row groups by `score`.
+    df, score Series, signal_name, labels -> qcut, NaN scores left unlabeled and excluded.
+    Returns: {signal_name, score, labels, cutpoints, frames, n_unlabeled}."""
     score = pd.Series(np.asarray(score, dtype="float64"), index=df.index)
     cats, edges = pd.qcut(score, 3, labels=list(labels), duplicates="drop",
                           retbins=True)
@@ -122,48 +85,36 @@ def _tercile_split(df, score, labels, signal_name):
     }
 
 
-# --------------------------------------------------------------------------- #
-# Umbrella 5 — Temporal volatility regime (ROW axis)
-# --------------------------------------------------------------------------- #
+# --- umbrella 5: temporal volatility regime (ROW axis) ---
 def split_by_volatility_regime(df, flow_col=FLOW_COL, window=12,
                                labels=("calm", "normal", "turbulent")):
-    """Split rows by local volatility of ``flow_col`` (calm / normal / turbulent).
+    """Split rows by local volatility of flow_col (calm / normal / turbulent).
+    Signal = rolling std over `window` buckets (12 = one day on the 2h grid), via EDA.rolling_volatility.
+    Returns: the _tercile_split dict."""
 
-    Signal = rolling std of net liquidity flow over ``window`` buckets
-    (12 = one day on the 2h grid) via :func:`EDA.rolling_volatility`. Dense, so its
-    terciles are balanced — unlike the 72%-zero ``market_stress_index``, which this
-    split is meant to be validated against rather than built from.
-    """
+    # dense signal, so its terciles balance — unlike the 72%-zero market_stress_index,
+    # which this split validates against rather than builds from
     score = EDA.rolling_volatility(df, flow_col, window=window)
     return _tercile_split(df, score, labels,
                           signal_name=f"rolling_vol({flow_col}, w={window})")
 
 
-# --------------------------------------------------------------------------- #
-# Umbrella 6 — Activity intensity (ROW axis) — transaction COUNT
-# --------------------------------------------------------------------------- #
+# --- umbrella 6: activity intensity (ROW axis) — transaction COUNT ---
 def split_by_activity_intensity(df, activity_col=ACTIVITY_COL,
                                 labels=("quiet", "active", "peak")):
     """Split rows by transaction count per bucket (quiet / active / peak).
-
-    Distinct from the whale split: this is *how many* transactions, regardless of
-    their $ size — a quiet bucket may still hold one huge whale trade.
-    """
+    df, activity_col -> counts only, regardless of $ size.
+    Returns: the _tercile_split dict. A quiet bucket may still hold one huge whale trade."""
     score = pd.to_numeric(df[activity_col], errors="coerce")
     return _tercile_split(df, score, labels, signal_name=activity_col)
 
 
-# --------------------------------------------------------------------------- #
-# Umbrella 7 — Whale dominance (ROW axis) — average transaction SIZE
-# --------------------------------------------------------------------------- #
+# --- umbrella 7: whale dominance (ROW axis) — average transaction SIZE ---
 def split_by_whale_dominance(df, volume_col=VOLUME_COL, count_col=ACTIVITY_COL,
                              labels=("retail", "mixed", "whale")):
     """Split rows by average transaction size = volume / count (retail / mixed / whale).
-
-    The whale signal is *volume concentrated into few transactions* (high average
-    size), not raw volume — so this is distinct from both the activity split (count)
-    and a plain volume tiering.
-    """
+    df, volume_col, activity_col.
+    Returns: the _tercile_split dict — concentration, not raw volume."""
     vol = pd.to_numeric(df[volume_col], errors="coerce")
     cnt = pd.to_numeric(df[count_col], errors="coerce")
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -172,23 +123,12 @@ def split_by_whale_dominance(df, volume_col=VOLUME_COL, count_col=ACTIVITY_COL,
                           signal_name=f"avg_tx_size({volume_col} / {count_col})")
 
 
-# --------------------------------------------------------------------------- #
-# Umbrella 2 — Co-movement clustering (COLUMN axis)
-# --------------------------------------------------------------------------- #
+# --- umbrella 2: co-movement clustering (COLUMN axis) ---
 def split_columns_by_correlation(df, columns=None, n_clusters=6, absolute=False,
                                  method="pearson", linkage="complete"):
-    """Group columns by co-movement via :func:`EDA.correlation_clusters`.
-
-    Uses the SIGNED correlation ``r`` in (-1, 1) (``absolute=False``): positively
-    co-moving columns (r -> +1) cluster together while anti-correlated columns
-    (r -> -1) are pushed apart. Surfaces redundant feature families. Cluster sizes are
-    structure-driven, so they are reported (not forced) — balance here means "no single
-    mega-cluster swallowing everything", which ``linkage='complete'`` (the default)
-    enforces; tune granularity via ``n_clusters``. Pass ``absolute=True`` to group by
-    magnitude only (co-moving OR exactly opposite).
-
-    Returns a dict: ``groups`` ({cluster: [columns]}) and ``n_clusters``.
-    """
+    """Group columns by co-movement via EDA.correlation_clusters.
+    Signed r by default (absolute=False), so anti-correlated columns are pushed apart; n_clusters tunes granularity.
+    Returns: {groups: {cluster: [columns]}, n_clusters} — sizes are reported, not forced."""
     cols = columns if columns is not None else numeric_columns(df)
     groups = EDA.correlation_clusters(df, cols, n_clusters=n_clusters,
                                       absolute=absolute, method=method,
@@ -196,18 +136,11 @@ def split_columns_by_correlation(df, columns=None, n_clusters=6, absolute=False,
     return {"groups": groups, "n_clusters": len(groups)}
 
 
-# --------------------------------------------------------------------------- #
-# Umbrella 3 — Tail-risk / volatility tier (COLUMN axis)
-# --------------------------------------------------------------------------- #
+# --- umbrella 3: tail-risk / volatility tier (COLUMN axis) ---
 def column_tail_scores(df, columns=None):
-    """Per-column heavy-tail / dispersion metrics + a composite ``tail_score``.
-
-    Three EDA metrics (all "bigger = wilder"): excess kurtosis, robust CV (IQR), and
-    Hill heaviness (``-hill_tail_index``, so a heavier tail = larger). Each is turned
-    into a percentile rank across columns (scale-free) and averaged into
-    ``tail_score`` in [0, 1]. NaN metrics (e.g. Hill needs >=10 positive values) are
-    skipped in the average.
-    """
+    """Per-column heavy-tail / dispersion metrics + a composite tail_score.
+    Excess kurtosis, robust CV (IQR), Hill heaviness — each percentile-ranked, then averaged.
+    Returns: DataFrame with tail_score in [0, 1]; NaN metrics skipped in the average."""
     cols = columns if columns is not None else numeric_columns(df)
     t = pd.DataFrame({
         "excess_kurtosis": column_stat_series(df, "excess_kurtosis", columns=cols),
@@ -227,41 +160,23 @@ def column_tail_scores(df, columns=None):
 
 def split_columns_by_tail_risk(df, columns=None,
                                labels=("stable", "moderate", "wild")):
-    """Tier columns into stable / moderate / wild by composite ``tail_score`` terciles.
-
-    Equal-count terciles over the columns, so the three tiers hold ~the same number
-    of columns. Returns a dict: ``scores`` (the per-column table), ``labels``
-    (Categorical aligned to columns), and ``groups`` ({tier: [columns]}).
-    """
+    """Tier columns into stable / moderate / wild by composite tail_score terciles.
+    df, optional precomputed scores -> equal-count terciles over the columns.
+    Returns: {scores, labels, groups}."""
     t = column_tail_scores(df, columns)
     cats = pd.qcut(t["tail_score"], 3, labels=list(labels), duplicates="drop")
     groups = {lab: t.index[cats == lab].tolist() for lab in cats.cat.categories}
     return {"scores": t, "labels": cats, "groups": groups}
 
 
-# --------------------------------------------------------------------------- #
-# Column split by ANY single per-column statistic (generic)
-# --------------------------------------------------------------------------- #
+# --- generic column split by ANY single per-column statistic ---
 def split_columns_by_stat(df, stat, threshold, stats=None, stat_col="column",
                           keep=(TIME_COL,)):
-    """Split ``df``'s feature columns into TWO frames by one per-column statistic.
+    """Split df's numeric feature columns into TWO frames by one per-column statistic.
+    stat: a STAT_COLS name; threshold: the cut (a value exactly on it goes high); stats: optional profile.
+    Returns: (low_df, high_df), each led by the `keep` key columns; NaN-stat columns dropped from both."""
 
-    Binary column split: every numeric feature of ``df`` is placed by whether its
-    ``stat`` value is below ``threshold`` (low frame) or at/above it (high frame — a
-    value exactly on the threshold goes high).
-
-    ``stat`` — one of :data:`STAT_COLS` (an ``adv_validation.statistical_validation``
-    profile column, e.g. ``"cv"``, ``"skewness"``, ``"p95"``, ``"excess_kurtosis"``).
-    ``threshold`` — the user-defined cut value.
-    ``stats`` — the precomputed profile table; if ``None`` it is computed with
-    ``adv.statistical_validation(df, save=False)``. ALL statistic calculation lives in
-    :mod:`adv_validation`; this module only reads the value and partitions the columns.
-
-    The columns to split are taken from ``df`` itself (every numeric feature) — there is
-    no column argument. Returns ``(low_df, high_df)``: the ``keep`` key column(s) followed
-    by the ``< threshold`` and ``>= threshold`` columns respectively. Columns whose
-    statistic is NaN are excluded from both.
-    """
+    # NOTE: all statistic calculation lives in adv_validation — this only reads and partitions
     if stat not in STAT_COLS:
         raise ValueError(f"stat must be one of STAT_COLS: {list(STAT_COLS)}")
     if stats is None:
@@ -279,17 +194,9 @@ def split_columns_by_stat(df, stat, threshold, stats=None, stat_col="column",
 def column_band_matrix(df, stats=None, stat_names=None, thresholds=None,
                        labels=("low", "moderate", "high"), columns=None,
                        stat_col="column"):
-    """Band every column under MANY statistics at once -> a (columns x stats) label grid.
-
-    Applies the same banding as :func:`split_columns_by_stat` for each name in
-    ``stat_names`` and assembles the labels into one frame: rows = columns, columns =
-    statistics, cells = band label. ``stat_names`` defaults to every numeric statistic in
-    the ``stats`` profile table. A stat whose values can't be cut into ``len(labels)``
-    bands (e.g. too many ties) is returned as an all-NaN column rather than raising.
-
-    A compact view of how each feature ranks across all stats simultaneously — its CV
-    band, skewness band, kurtosis band, ... side by side.
-    """
+    """Band every column under MANY statistics at once.
+    stat_names defaults to every numeric stat in the profile; same banding as split_columns_by_stat.
+    Returns: a (columns x stats) label grid; an uncuttable stat comes back all-NaN, never raising."""
     if stat_names is None:
         if stats is None:
             raise ValueError("pass stat_names, or a `stats` table to default them from")
@@ -305,11 +212,10 @@ def column_band_matrix(df, stats=None, stat_names=None, thresholds=None,
     return pd.DataFrame(out)
 
 
-# --------------------------------------------------------------------------- #
-# Proof / evidence helpers (before vs after a split)
-# --------------------------------------------------------------------------- #
+# --- proof / evidence helpers (before vs after a split) ---
 def split_balance(labels):
     """Count + percentage of rows per group — the balance check for requirement 5."""
+    # sanity check that the terciles really came out ~1/3 each
     vc = pd.Series(labels).value_counts(dropna=False)
     vc = vc.reindex(pd.Series(labels).cat.categories) if hasattr(labels, "cat") else vc
     out = pd.DataFrame({"n": vc, "pct": (vc / vc.sum() * 100).round(2)})
@@ -317,11 +223,9 @@ def split_balance(labels):
 
 
 def group_stat_table(frames, columns, before=None, agg="median"):
-    """One aggregate (median/mean/std/sum) per ``column`` for each row-group frame.
-
-    With ``before`` (the full frame) included as the first column, this is the literal
-    before/after evidence: how each metric shifts from the whole panel to each piece.
-    """
+    """One aggregate (median/mean/std/sum) per `column` for each row-group frame.
+    frames, column, agg, before (the full frame) as the leading column.
+    Returns: the before/after evidence table."""
     funcs = {"median": np.nanmedian, "mean": np.nanmean,
              "std": lambda a: np.nanstd(a, ddof=1), "sum": np.nansum}
     f = funcs[agg]
@@ -338,12 +242,9 @@ def group_stat_table(frames, columns, before=None, agg="median"):
 
 
 def cluster_coherence(df, groups, method="pearson"):
-    """Within-cluster vs overall mean ``r`` — proof clusters are internally coherent.
-
-    A good clustering has within-cluster mean correlation ``r`` (signed, in (-1, 1))
-    well above the overall average pairwise ``r``. Returns a per-cluster table (size,
-    mean within-``r``) plus an ``overall`` row for the baseline.
-    """
+    """Within-cluster vs overall mean r — proof the clusters are internally coherent.
+    df, groups -> signed r in (-1, 1).
+    Returns: per-cluster table (size, mean within-r) plus an `overall` baseline row."""
     cols = [c for g in groups.values() for c in g]
     corr = df[cols].apply(pd.to_numeric, errors="coerce").corr(method=method)
 
@@ -366,13 +267,9 @@ def cluster_coherence(df, groups, method="pearson"):
 def robust_profile(frames, columns, stats=("mean", "std", "cv", "skewness",
                                            "excess_kurtosis", "null_pct", "zero_pct"),
                    before=None):
-    """Rich robust per-column profile for each row-group via ``adv.statistical_validation``.
-
-    Runs the full pre-EDA profile (``save=False`` — no files written) on each frame and
-    stacks the chosen ``stats`` into one tidy table indexed by (column, group). With
-    ``before`` (the full frame) added as a "ALL" group, this is the deeper before/after
-    statistical evidence that a split actually changed the distribution, not just counts.
-    """
+    """Rich robust per-column profile per row-group, via adv.statistical_validation(save=False).
+    frames, stats to keep, before (added as the "ALL" group).
+    Returns: one tidy table indexed by (column, group) — the deeper before/after evidence."""
     pieces = {}
     if before is not None:
         pieces["ALL"] = before
@@ -391,11 +288,11 @@ def robust_profile(frames, columns, stats=("mean", "std", "cv", "skewness",
 
 def column_group_profile(df, groups, metrics=("excess_kurtosis", "hill_tail_index",
                                               "robust_cv_iqr")):
-    """Mean per-column tail metric for each column tier — proof tiers really differ.
+    """Mean per-column tail metric for each column tier — proof the tiers really differ.
+    scores table, labels.
+    Returns: table indexed by tier with each metric's mean + n_cols."""
 
-    Confirms the 'wild' tier has higher kurtosis / dispersion and lower Hill α than
-    'stable'. Returns a table indexed by tier with the mean of each metric + n_cols.
-    """
+    # sanity check: 'wild' should show higher kurtosis and lower Hill alpha than 'stable'
     scores = column_tail_scores(df, [c for g in groups.values() for c in g])
     rows = []
     for name, cs in groups.items():

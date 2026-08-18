@@ -1,26 +1,16 @@
 #!/bin/bash
-# Start the MLflow tracking server LOCALLY (no Docker).
-#
-#   ./scripts/mlflow_local.sh
-#
-# Serves the SAME database the Docker `mlflow` service uses — ./mlflow_data/ is
-# bind-mounted there, so the container never held the data. Switching between
-# the two is a change of process, not a migration: all history is preserved.
-#
-# Runs in the FOREGROUND. This terminal becomes the server; leave the tab open.
-# Ctrl+C stops it. Tracking only works while it is running.
-#
-# Why it refuses to start alongside the Docker service: both would write the same
-# SQLite file, and SQLite tolerates exactly one writer. Two means lock errors or
-# a corrupted database.
+# Start the MLflow tracking server LOCALLY (no Docker), in the FOREGROUND.
+#   ./scripts/mlflow_local.sh     — Ctrl+C stops it; tracking only works while it runs.
+# Serves the SAME ./mlflow_data/ SQLite db the Docker `mlflow` service bind-mounts,
+# so switching is a change of process, not a migration. Refuses to run alongside
+# that service — SQLite tolerates exactly one writer.
 
 set -euo pipefail
 
 PORT=5001
 EXPERIMENT_HINT="credit_risk"
 
-# Resolve the repo root from this script's own location, so the script works from
-# any working directory.
+# Repo root from the script's own location, so it works from any working directory.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 

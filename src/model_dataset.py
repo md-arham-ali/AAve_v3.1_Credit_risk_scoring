@@ -1,13 +1,10 @@
 """Modeling stage — daily credit-risk dataset assembly.
 
-Rolls the 2h protocol panel to daily grain (events/flows sum, ratios rebuilt as
-ratio-of-sums), joins the dense 24h liquidation / user-account risk frames,
-restricts to the credit-risk feature set, and adds the forward-looking
-stress/volume targets. Orchestrated by notebooks/model_dataset.ipynb.
-
-
-THE 7D PART TO BE DONE LATER, WITH MORE BULK DATA
+2h panel -> daily grain, joined with the 24h liq/user risk frames, restricted to
+the credit-risk feature set, plus the forward-looking stress/volume targets.
 """
+
+# TODO: the 7d variant waits on more bulk data.
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,10 +23,8 @@ from model_config import (TIME_COL, HORIZONS, TARGET_BASE_COL, REG_TARGET,
 
 def daily_agg_map(columns):
     """Aggregation function per column for the 2h->daily rollup.
-
-    AGG_OVERRIDES first, then the ordered AGG_RULES suffix/prefix matchers;
-    anything unmatched aggregates with the (time-weighted) mean.
-    """
+    columns -> AGG_OVERRIDES first, then the ordered AGG_RULES matchers.
+    Returns: {column: agg}; unmatched columns fall back to mean."""
     out = {}
     for col in columns:
         if col in AGG_OVERRIDES:
@@ -46,11 +41,8 @@ def daily_agg_map(columns):
 
 def build_daily_panel(df, time_col=TIME_COL, freq="24h"):
     """Aggregate the 2h protocol panel to daily grain with type-appropriate functions.
-
-    Event counts / uniques / valued flows are summed; ratios and state averages are
-    averaged. Reuses transform.aggregate_by_time_bucket (one resample pass with a
-    per-column agg dict) and returns the frame with canonical string keys.
-    """
+    df -> counts/flows summed, ratios and state averaged (via transform.aggregate_by_time_bucket).
+    Returns: daily DataFrame with canonical string keys."""
     value_cols = [c for c in df.columns if c != time_col]
     amap = daily_agg_map(value_cols)
     daily = tf.aggregate_by_time_bucket(df, time_col, value_cols, agg_func=amap, freq=freq)
@@ -59,10 +51,8 @@ def build_daily_panel(df, time_col=TIME_COL, freq="24h"):
 
 def recompute_daily_ratios(daily, ratios=RATIO_RECIPES, shares=SHARE_RECIPES):
     """Rebuild ratio columns from their daily-summed components (ratio-of-sums).
-
-    Overwrites the mean-of-2h-ratios values left by the rollup so every daily
-    ratio is consistent with the daily flows it is built from.
-    """
+    df -> overwrites the mean-of-2h-ratios values left by the rollup.
+    Returns: the frame with consistent daily ratios."""
     out = daily.copy()
     n = 0
     for col, (num, den) in ratios.items():
@@ -80,12 +70,8 @@ def recompute_daily_ratios(daily, ratios=RATIO_RECIPES, shares=SHARE_RECIPES):
 
 def join_model_frames(daily, liq, user, time_col=TIME_COL):
     """Inner-join the daily panel with the liquidation and user-account risk frames.
-
-    The liq/user frames carry borrow-context columns duplicated from the panel
-    (added by feature_addition's borrow_context); those are verified equal
-    (allclose on the joined keys) and then dropped so each column appears once.
-    Prints how many rows the inner joins drop.
-    """
+    Duplicated borrow-context columns are allclose-verified, then dropped.
+    Returns: the joined frame; prints how many rows the inner joins drop."""
     daily = canonicalize_keys(daily)
     liq = canonicalize_keys(liq)
     user = canonicalize_keys(user)
@@ -113,12 +99,9 @@ def join_model_frames(daily, liq, user, time_col=TIME_COL):
 
 def fill_conditional_zeros(df, columns=LIQ_CONDITIONAL_COLS, indicator_col="has_liquidation",
                            count_col="liquidation_tx_count"):
-    """Zero-fill conditional liquidation ratios and add the has-liquidation indicator.
-
-    On zero-liquidation days the denominator guard leaves these ratios NA; the honest
-    value is 0 (no liquidation stress). The indicator keeps "no event" separable from
-    "small event" for the models (E29 precedent on the 2h panel).
-    """
+    """Zero-fill conditional liquidation ratios; add the has-liquidation indicator.
+    df -> NA ratios on zero-liquidation days become 0 (the honest value).
+    Returns: the frame plus the indicator, keeping "no event" separable from "small event"."""
     out = df.copy()
     cols = [c for c in columns if c in out.columns]
     out[cols] = out[cols].fillna(0.0)
@@ -128,12 +111,9 @@ def fill_conditional_zeros(df, columns=LIQ_CONDITIONAL_COLS, indicator_col="has_
 
 
 def sync_priorities(weights=None):
-    """Push the tiered CREDIT_RISK_WEIGHTS into column_priority.json (EDA map).
-
-    One weighting scheme for the whole project — the tiered dict here replaces
-    both the old flat 2.0 sync and the hand-typed notebook copy that disagreed
-    with it. Returns the refreshed map DataFrame.
-    """
+    """Push the tiered CREDIT_RISK_WEIGHTS into column_priority.json (the EDA map).
+    Replaces the old flat 2.0 sync — one weighting scheme for the whole project.
+    Returns: the refreshed map DataFrame."""
     weights = CREDIT_RISK_WEIGHTS if weights is None else weights
     eda.register_columns(list(weights))
     return eda.update_priorities(dict(weights))
@@ -141,11 +121,8 @@ def sync_priorities(weights=None):
 
 def select_credit_risk_columns(df, source="constant", threshold=CREDIT_RISK_PRIORITY):
     """Ordered training-feature list — credit-risk metrics only.
-
-    source="constant" (default) intersects CREDIT_RISK_COLS with the frame;
-    source="priority" instead takes every column whose column_priority.json score
-    is >= threshold. Missing expected columns are printed, not raised.
-    """
+    source="constant" intersects CREDIT_RISK_COLS; "priority" takes score >= threshold.
+    Returns: list of column names; missing expected columns are printed, not raised."""
     if source == "priority":
         pri = eda.get_priorities()
         wanted = pri.loc[pri["score"] >= threshold, "column"].tolist()
@@ -160,16 +137,11 @@ def select_credit_risk_columns(df, source="constant", threshold=CREDIT_RISK_PRIO
 
 
 def add_forward_targets(df, target_col=TARGET_BASE_COL, horizons=HORIZONS, time_col=TIME_COL):
-    """Add forward-looking target columns and trim the incomplete trailing window.
+    """Add forward-looking targets and trim the incomplete trailing window.
+    target_next_1d = t+1; target_fwd_max_{h}d = max over t+1..t+h; y_reg_log1p = log1p of the former.
+    Returns: the frame minus the last max(horizons) rows (count printed)."""
 
-    target_next_1d          = target_col at t+1 (raw USD)
-    target_fwd_max_{h}d     = max of target_col over t+1 .. t+h
-    y_reg_log1p             = log1p(target_next_1d)  — heavy-tail compression
-
-    Binarization into y_stress_{h}d happens AFTER the chronological split so the
-    stress threshold is provably train-only. The trailing max(horizons) rows have
-    incomplete forward windows and are dropped (count printed).
-    """
+    # binarization into y_stress_{h}d waits until after the split — keeps the threshold train-only
     out = df.sort_values(time_col, kind="stable").reset_index(drop=True).copy()
     s = out[target_col].astype(float)
     out["target_next_1d"] = s.shift(-1)

@@ -1,18 +1,7 @@
 """Transformation helpers for the Aave V3.1 Dune result tables.
 
-This stage READS the versioned CSVs in ``query_result_data/`` and never writes
-back to that folder — the raw extracts stay untouched. Because each fetch saves
-a new ``query_result_data_{query_id}_{fetch_time}.csv``, the loaders here resolve
-the *latest* version per table by default.
-
-Step 1 (this module) is just loading: turn a table label into a DataFrame.
-Later transformation logic (column ordering, derived columns, ...) builds on top.
-
-Libraries imported by this module:
-    pandas                -> read CSVs into DataFrames
-    re, pathlib           -> standard library (filename parsing)
-    data_validation       -> reuse the query-id -> table-label map (single source
-                             of truth) so labels never drift between stages
+READS the versioned CSVs in query_result_data/ and never writes back there. Each
+fetch adds a new timestamped file, so the loaders resolve the latest per table.
 """
 
 import re
@@ -45,10 +34,8 @@ def _parse_name(path):
 
 def latest_paths(source_dir=SOURCE_DIR):
     """Map each table label -> its newest versioned CSV path.
-
-    The timestamp suffix sorts lexicographically in chronological order, so the
-    max string per query id is the most recent fetch.
-    """
+    data_dir -> filenames parsed for query id + fetch timestamp.
+    Returns: {label: Path}. The timestamp suffix sorts lexicographically, so max = newest."""
     newest = {}  # query_id -> (timestamp, path)
     for path in Path(source_dir).glob("*.csv"):
         qid, stamp = _parse_name(path)
@@ -69,11 +56,8 @@ def list_tables(source_dir=SOURCE_DIR):
 
 def load_table(table, source_dir=SOURCE_DIR):
     """Load one result table as a DataFrame (read-only).
-
-    ``table`` is either a table label (e.g. "supply_withdraw"), whose latest
-    version is resolved automatically, or a direct path to a specific CSV.
-    Values are left as-loaded (time_bucket / asset stay strings).
-    """
+    table: a label whose latest version is resolved, or a direct CSV path.
+    Returns: DataFrame as-loaded — time_bucket / asset stay strings."""
     path = Path(table)
     if path.suffix == ".csv" and path.exists():
         return pd.read_csv(path)
@@ -94,13 +78,8 @@ def load_all(source_dir=SOURCE_DIR):
     }
 
 
-# --------------------------------------------------------------------------- #
-# Column division: scale raw integer amounts to real token units
-# --------------------------------------------------------------------------- #
-# The extracts keep token amounts as raw integers (object/strings) in columns
-# ending in ``_raw``. Real token units = raw / 10**decimals, where ``decimals``
-# is per-asset. Division uses ``Decimal`` so the big integers stay exact before
-# the result is cast to float.
+# --- per-ASSET scaling: raw integer amounts -> real token units ---
+# Division goes through Decimal so the big integers stay exact before the float cast.
 RAW_SUFFIX = "_raw"
 
 
@@ -111,16 +90,9 @@ def raw_amount_columns(df, suffix=RAW_SUFFIX):
 
 def decimals_map(decimals, asset_col="asset", decimals_col="decimals", unit_col="unit",
                  token_unit="raw_token_amount"):
-    """Normalize a ``decimals`` argument into an ``{asset_address: int}`` lookup.
-
-    Accepts:
-      * ``int``                  -> same decimals for every asset (returned as-is),
-      * ``dict`` / ``pd.Series`` -> used directly,
-      * ``pd.DataFrame``         -> built from its asset + decimals columns. If the
-        frame has a ``unit`` column (the decimals-reference table), only the
-        ``raw_token_amount`` rows are used so block-number rows (decimals 0)
-        don't override token decimals. Duplicate assets keep the first row.
-    """
+    """Normalize a `decimals` argument into an {asset_address: int} lookup.
+    Accepts int (uniform), dict/Series (used directly), or DataFrame (asset + decimals cols).
+    Returns: the lookup. Reference tables use only raw_token_amount rows; dupes keep the first."""
     if isinstance(decimals, int):
         return decimals
     if isinstance(decimals, pd.Series):
@@ -142,11 +114,9 @@ def _scaled_name(col, suffix):
 
 
 def _scale_value(value, dec):
-    """Divide one value by ``10**dec`` exactly (Decimal -> float).
-
-    Returns NaN when either the value or its decimals is missing, so scaling only
-    happens when both are present. The big integer stays exact until the final cast.
-    """
+    """Divide one value by 10**dec exactly (Decimal -> float).
+    value, dec.
+    Returns: float, or NaN when either side is missing."""
     if pd.isna(value) or pd.isna(dec):
         return float("nan")
     return float(Decimal(str(value)) / (Decimal(10) ** int(dec)))
@@ -154,30 +124,11 @@ def _scale_value(value, dec):
 
 def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
                       decimals_col="decimals", drop_raw=False, suffix="_scaled"):
-    """Divide raw integer-amount columns by ``10**decimals`` -> real token units.
+    """Divide raw integer-amount columns by 10**decimals -> real token units.
+    decimals: int/dict/Series/DataFrame (see decimals_map); columns defaults to every *_raw;
+    asset_col, decimals_col, drop_raw, suffix. Returns: a NEW DataFrame."""
 
-    Returns a NEW DataFrame (the input is not mutated).
-
-    Parameters
-    ----------
-    decimals : int | dict | pd.Series | pd.DataFrame
-        Per-asset token decimals; see :func:`decimals_map`. A DataFrame may be a
-        decimals-reference table OR any frame that carries per-asset decimals (e.g.
-        the oracle-price table, whose ``decimals`` column is read the same way).
-    columns : list[str] | None
-        Raw columns to scale. Defaults to every column ending in ``_raw``.
-    asset_col : str
-        Asset column — used both to look up per-asset decimals on ``df`` and to read
-        the asset key from a ``decimals`` DataFrame (ignored when ``decimals`` is int).
-    decimals_col : str
-        Name of the decimals column to read from a ``decimals`` DataFrame.
-    drop_raw : bool
-        Drop the original raw columns after scaling.
-    suffix : str
-        Suffix for the scaled column when the source name doesn't end in ``_raw``.
-        Columns ending in ``_raw`` become the same name without the suffix
-        (e.g. ``supply_amount_raw`` -> ``supply_amount``).
-    """
+    # NOTE: *_raw columns lose the suffix rather than gain one (supply_amount_raw -> supply_amount)
     cols = columns if columns is not None else raw_amount_columns(df)
     if not cols:
         return df.copy()
@@ -201,24 +152,14 @@ def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Per-COLUMN scaling: scale whole columns by a fixed decimals from a metric map
-# --------------------------------------------------------------------------- #
-# Companion to scale_by_decimals (per-ASSET, ``_raw`` columns). Some metrics carry a
-# FIXED decimals that is the same for every row of the column rather than per-asset
-# (e.g. Aave config metrics: supply_cap/borrow_cap -> 0, debt_ceiling -> 2, the bps
-# fields -> 4). Their decimals live in a reference table keyed by ``metric`` (the
-# column name) + ``decimals``; this scales each matched column by ``10**decimals``.
+# --- per-COLUMN scaling: fixed decimals from a metric map ---
+# Companion to scale_by_decimals. Aave config metrics carry one decimals for the whole
+# column (caps -> 0, debt_ceiling -> 2, bps fields -> 4), keyed by `metric` in the reference.
 
 def column_decimals_map(decimals, metric_col="metric", decimals_col="decimals"):
-    """Normalize a per-column decimals argument into a ``{column_name: int}`` lookup.
-
-    Accepts:
-      * ``dict`` / ``pd.Series`` -> used directly (index/keys are column names),
-      * ``pd.DataFrame``         -> built from its ``metric`` + ``decimals`` columns
-        (``metric`` holds the column name). Rows with a null metric or null decimals
-        are dropped; duplicate metrics keep the first row.
-    """
+    """Normalize a per-column decimals argument into a {column_name: int} lookup.
+    Accepts dict/Series (keys are column names) or DataFrame (metric + decimals cols).
+    Returns: the lookup; null rows dropped, duplicate metrics keep the first."""
     if isinstance(decimals, pd.Series):
         return decimals.dropna().astype(int).to_dict()
     if isinstance(decimals, pd.DataFrame):
@@ -230,27 +171,9 @@ def column_decimals_map(decimals, metric_col="metric", decimals_col="decimals"):
 def scale_columns_by_decimals(df, decimals, columns=None, metric_col="metric",
                               decimals_col="decimals", overwrite=False,
                               drop_original=False, suffix="_scaled"):
-    """Divide whole columns by ``10**decimals``, with a FIXED decimals PER COLUMN.
-
-    Returns a NEW DataFrame (the input is not mutated). For each scaled column the
-    value is divided by ``10**decimals`` only when both the value and its decimals are
-    present; otherwise the result is NaN (same rule as :func:`scale_by_decimals`).
-
-    Parameters
-    ----------
-    decimals : dict | pd.Series | pd.DataFrame
-        Per-column decimals; see :func:`column_decimals_map`. A DataFrame is read from
-        its ``metric_col`` (column name) and ``decimals_col``.
-    columns : list[str] | None
-        Columns to scale. Defaults to every ``df`` column found in the decimals map.
-    overwrite : bool
-        Write the scaled values back onto the source column. Otherwise a new
-        ``<col><suffix>`` column is added.
-    drop_original : bool
-        Drop the source columns after scaling (ignored when ``overwrite`` is True).
-    suffix : str
-        Suffix for the scaled column when ``overwrite`` is False.
-    """
+    """Divide whole columns by 10**decimals, with a FIXED decimals PER COLUMN.
+    decimals (see column_decimals_map), columns, overwrite, drop_original, suffix.
+    Returns: a NEW DataFrame; NaN wherever value or decimals is missing."""
     dmap = column_decimals_map(decimals, metric_col=metric_col, decimals_col=decimals_col)
     cols = [c for c in (columns if columns is not None else df.columns)
             if c in dmap and c in df.columns]
@@ -272,45 +195,18 @@ def scale_columns_by_decimals(df, decimals, columns=None, metric_col="metric",
 
 
 
-# --------------------------------------------------------------------------- #
-# Price multiplication: value each amount in USD and in ETH
-# --------------------------------------------------------------------------- #
-# The amount frame and the oracle-price frame are matched on (time_bucket, asset).
-# The two frames store time_bucket in different string formats
-# ("2025-11-01 00:00:00.000 UTC" vs "2025-11-01 00:00:00"), so both are normalized
-# to a UTC datetime key before matching. Each amount column gets two new value
-# columns: amount * USD price and amount * ETH price. The multiplication happens
-# only when BOTH operands are present; a missing price (the asset/time is absent
-# from the price table, or the price is null) or a missing amount yields NaN, so
-# rows with no oracle price (e.g. dates the price table doesn't cover) are left
-# blank rather than silently valued at 0.
+# --- price multiplication: value each amount in USD and in ETH ---
+# Matched on (time_bucket, asset); the two frames store time_bucket in different string
+# formats, so both are normalized to a UTC datetime key first. Missing price or amount
+# yields NaN, never a silent 0.
 
 def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
                       asset_col="asset", usd_col="avg_price_usd",
                       eth_col="avg_price_eth", usd_suffix="_value_usd",
                       eth_suffix="_value_eth"):
-    """Value each amount column in USD and ETH by matching ``df`` to a price table.
-
-    Returns a NEW DataFrame (the input is not mutated). For every column in
-    ``amount_columns`` two columns are added::
-
-        <col><usd_suffix> = amount * USD price
-        <col><eth_suffix> = amount * ETH price
-
-    Rows are matched on (``time_col``, ``asset_col``). The two frames may store
-    ``time_col`` in different string formats, so it is normalized to a UTC datetime
-    key on both sides. The product is computed only when both the amount and the
-    matched price are present; if either is missing the result is NaN (not 0).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The amount frame (e.g. the scaled supply/withdraw amounts).
-    prices : pd.DataFrame
-        The oracle-price frame holding the USD and ETH price columns.
-    amount_columns : list[str]
-        The (real-unit) amount columns to value.
-    """
+    """Value each amount column in USD and ETH against an oracle-price table.
+    df, prices, amount_columns, time_col, asset_col, usd_suffix, eth_suffix.
+    Returns: a NEW DataFrame with two value columns per amount; NaN when either side is absent."""
     out = df.copy()
 
     # normalized match key on both sides (the tables differ in time_bucket format)
@@ -337,28 +233,16 @@ def multiply_by_price(df, prices, amount_columns, time_col="time_bucket",
         out[f"{col}{eth_suffix}"] = amount * eth
     return out
 
-# --------------------------------------------------------------------------- #
-# Null repair after the protocol-panel merge (left joins on time_bucket)
-# --------------------------------------------------------------------------- #
-# The final merge left-joins per-table 6h/2h aggregates onto the supply/withdraw
-# bucket grid, which produces two very different kinds of null:
-#   (1) EVENT columns (tx counts, unique users, valued sums): a bucket missing
-#       from a source table means NO events happened there — the true value is 0,
-#       not "unknown". Left as null they read as >70% missing (liquidations are
-#       rare per 2h bucket) and poison every downstream ratio.
-#   (2) STATE columns (user-account avg_* collateral/debt/ltv): sampled from
-#       getUserAccountData calls that land in only ~half the buckets. State
-#       persists between observations, so the last observed value is carried
-#       forward (same treatment as the reserve_config state panel), bounded by a
-#       staleness cap.
+# --- null repair after the protocol-panel merge (left joins on time_bucket) ---
+# Two kinds of null come out of that merge: EVENT columns, where an absent bucket truly
+# means zero events (left null they read >70% missing and poison every ratio), and STATE
+# columns sampled from getUserAccountData, which land in ~half the buckets and must be
+# carried forward under a staleness cap.
 
 def fill_event_zeros(df, columns):
     """Fill nulls with 0 in EVENT columns (structural zeros from left joins).
-
-    Returns a NEW DataFrame. Only use on additive event aggregates (counts,
-    unique-user counts, valued sums) where an absent bucket means "no events" —
-    never on sampled state or ratio columns, where null means "not observed".
-    """
+    df, columns -> counts, unique-user counts, valued sums only.
+    Returns: a NEW DataFrame. Never use on state or ratio columns."""
     out = df.copy()
     cols = [c for c in columns if c in out.columns]
     out[cols] = out[cols].fillna(0)
@@ -368,25 +252,8 @@ def fill_event_zeros(df, columns):
 def ffill_state_columns(df, columns, time_col="time_bucket", limit=None,
                         observed_col=None, age_col=None):
     """Forward-fill sampled STATE columns along the time axis.
-
-    Returns a NEW DataFrame in the original row order. Rows are ordered by the
-    parsed ``time_col`` for the fill, so the frame does not have to be pre-sorted.
-
-    Parameters
-    ----------
-    columns : list[str]
-        The state columns to carry forward (filled together, so a bucket keeps a
-        consistent snapshot from a single observation).
-    limit : int | None
-        Staleness cap — the maximum number of consecutive buckets a value may be
-        carried. ``None`` carries indefinitely.
-    observed_col : str | None
-        If given, adds a boolean column: True where the bucket had its own
-        observation (any state column non-null before the fill).
-    age_col : str | None
-        If given, adds an int column: buckets since the last observation
-        (0 = observed in this bucket; null before the first observation).
-    """
+    columns (filled together), limit (staleness cap), observed_col, age_col.
+    Returns: a NEW DataFrame in the original row order."""
     order = pd.to_datetime(df[time_col], utc=True, format="mixed").sort_values().index
     out = df.copy()
     cols = [c for c in columns if c in out.columns]

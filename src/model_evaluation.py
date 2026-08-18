@@ -1,9 +1,4 @@
-"""Modeling stage — evaluation metrics, embargoed CV, and walk-forward tuning.
-
-Classification / regression metric dicts (with rank-score Brier guard and clipped
-USD back-transform), the moving-block bootstrap AUC CI, the embargoed walk-forward
-CV scorers, and the train-only grid tuners. Consumed by model_training.
-"""
+"""Modeling stage — evaluation metrics, embargoed walk-forward CV, and grid tuning."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,11 +19,9 @@ from model_split import fit_scaler, apply_scaler, walk_forward_indices
 
 
 def best_f1_threshold(y_true, scores):
-    """Threshold that maximizes F1 on the given (validation) scores.
-
-    Replaces the arbitrary fixed 0.5 cut on uncalibrated / class-weighted scores;
-    tuned on val only, then applied unchanged to test.
-    """
+    """Threshold maximizing F1 on the given (validation) scores.
+    y_true, scores -> sweep over candidate cuts.
+    Returns: float threshold. Tuned on val only, applied unchanged to test."""
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores, dtype=float)
     if len(np.unique(y)) < 2:
@@ -39,11 +32,9 @@ def best_f1_threshold(y_true, scores):
 
 
 def evaluate_classification(y_true, scores, threshold=0.5, proper_probs=True):
-    """{roc_auc, pr_auc, f1, brier, n_pos, n} — AUCs NaN when y has one class.
-
-    brier is NaN for rank-normalized scores (proper_probs=False): a squared error
-    against ranks is not a Brier score and must not sit next to real ones.
-    """
+    """Classification metrics for one split.
+    y_true, scores, threshold, proper_probs -> AUCs NaN when y has one class.
+    Returns: {roc_auc, pr_auc, f1, brier, n_pos, n}; brier NaN for rank scores."""
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores, dtype=float)
     single = len(np.unique(y)) < 2
@@ -57,12 +48,11 @@ def evaluate_classification(y_true, scores, threshold=0.5, proper_probs=True):
 
 
 def evaluate_regression(y_true_log, pred_log, clip_max_log=None):
-    """{rmse, mae, r2, mae_usd} on the log1p scale.
+    """Regression metrics on the log1p scale.
+    y_true, y_pred, train target range for the expm1 clip.
+    Returns: {rmse, mae, r2, mae_usd}."""
 
-    mae_usd back-transforms through expm1 with predictions CLIPPED to the train
-    target range — an extrapolating linear model at log 21+ otherwise turns into a
-    billion-dollar MAE that says nothing about typical error.
-    """
+    # clip matters: an extrapolating linear model at log 21+ gives a billion-dollar MAE.
     yt = np.asarray(y_true_log, dtype=float)
     yp = np.asarray(pred_log, dtype=float)
     yp_clip = np.clip(yp, 0.0, clip_max_log) if clip_max_log is not None else yp
@@ -76,11 +66,9 @@ def evaluate_regression(y_true_log, pred_log, clip_max_log=None):
 
 def bootstrap_auc_ci(y_true, scores, n_boot=1000, block=7, level=0.95,
                      seed=RANDOM_STATE):
-    """Moving-block bootstrap CI for ROC-AUC on a time-ordered evaluation split.
-
-    Blocks of `block` consecutive days respect the serial correlation an iid
-    bootstrap would ignore. Returns {auc, lo, hi, n_boot_valid}.
-    """
+    """Moving-block bootstrap CI for ROC-AUC on a time-ordered split.
+    y_true, scores, block (consecutive days per block), n_boot.
+    Returns: {auc, lo, hi, n_boot_valid}."""
     y = np.asarray(y_true).astype(int)
     s = np.asarray(scores, dtype=float)
     n = len(y)
@@ -102,6 +90,7 @@ def bootstrap_auc_ci(y_true, scores, n_boot=1000, block=7, level=0.95,
 
 def _fold_matrices(train_t, cols, tr_idx, te_idx, scaled):
     """Refit the scaler on a fold's train slice; return the fold's X matrices."""
+    # scaler is re-fit inside the fold, never on the full train block
     params = fit_scaler(train_t.iloc[tr_idx], cols)
     X_tr = apply_scaler(train_t.iloc[tr_idx], params, cols, standardize=scaled).to_numpy()
     X_te = apply_scaler(train_t.iloc[te_idx], params, cols, standardize=scaled).to_numpy()
@@ -109,11 +98,9 @@ def _fold_matrices(train_t, cols, tr_idx, te_idx, scaled):
 
 
 def cross_val_auc(name, data, target="y_stress_1d", n_splits=N_CV_SPLITS, params=None):
-    """Embargoed walk-forward CV ROC-AUC on TRAIN (scaler re-fit inside each fold).
-
-    Folds whose slices have a single class are skipped (NaN). Returns
-    {mean, std, folds, n_valid}.
-    """
+    """Embargoed walk-forward CV ROC-AUC on TRAIN; scaler re-fit inside each fold.
+    X, y, times, n_folds, embargo -> single-class folds skipped as NaN.
+    Returns: {mean, std, folds, n_valid}."""
     spec = CLASSIFIER_SPECS[name]
     train_t = data["frames_t"]["train"]
     cols = data["feature_cols"]
@@ -140,6 +127,7 @@ def cross_val_auc(name, data, target="y_stress_1d", n_splits=N_CV_SPLITS, params
 
 def cross_val_rmse(name, data, target=REG_TARGET, n_splits=N_CV_SPLITS, params=None):
     """Embargoed walk-forward CV RMSE(log) on TRAIN for one registry regressor."""
+    # same embargoed folds as cross_val_auc, error metric instead
     spec = REGRESSOR_SPECS[name]
     train_t = data["frames_t"]["train"]
     cols = data["feature_cols"]
@@ -159,10 +147,8 @@ def cross_val_rmse(name, data, target=REG_TARGET, n_splits=N_CV_SPLITS, params=N
 
 def tune_classifier(name, data, target="y_stress_1d", grid=None, n_splits=N_CV_SPLITS):
     """Pick the grid config with the best embargoed walk-forward CV AUC on TRAIN.
-
-    Returns {best_params, best_cv, table} — the table shows every config so the
-    choice is auditable. Selection never touches val or test.
-    """
+    spec grid + train arrays; selection never touches val or test.
+    Returns: {best_params, best_cv, table} — table lists every config, so it is auditable."""
     grid = CLASSIFIER_GRIDS.get(name, [{}]) if grid is None else grid
     rows = []
     for params in grid:
@@ -178,6 +164,7 @@ def tune_classifier(name, data, target="y_stress_1d", grid=None, n_splits=N_CV_S
 
 def tune_regressor(name, data, target=REG_TARGET, grid=None, n_splits=N_CV_SPLITS):
     """Pick the grid config with the lowest walk-forward CV RMSE(log) on TRAIN."""
+    # train-only selection, same rule as tune_classifier
     grid = REGRESSOR_GRIDS.get(name, [{}]) if grid is None else grid
     rows = []
     for params in grid:

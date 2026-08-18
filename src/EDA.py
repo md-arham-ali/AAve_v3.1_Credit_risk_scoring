@@ -1,28 +1,15 @@
 """Advanced univariate statistics for volatile / heavy-tailed financial data.
-These are EDA metrics (tail risk, drawdown, concentration, robust distribution
-shape, risk-adjusted return, dependence) that go beyond the validation profile in
-``adv_validation.statistical_validation``. Each is a small generic function that
-accepts EITHER a 1-D series-like (list / np.ndarray / pd.Series) OR ``(df, column)``,
-and returns a float (np.nan when there isn't enough data or a denominator is 0).
 
-Decimals-safety: parsing is delegated to ``adv_validation`` — ``_to_number`` /
-``_numeric_pairs`` read uint256 / RAY / WAD integer STRINGS exactly and the
-2**256-1 no-debt health-factor sentinel is dropped — so these run unchanged on the
-raw query tables and on the scaled transformed frames. The genuinely complex pieces
-(robust moments: skewness / excess kurtosis) reuse ``adv._series_stats`` rather than
-being re-derived here.
+Tail risk, drawdown, concentration, robust shape, risk-adjusted return, dependence —
+beyond adv_validation.statistical_validation. Every function takes a 1-D series-like
+OR (df, column) and returns a float (NaN on too little data or a zero denominator).
 
-Conventions
------------
-* "returns / P&L" metrics (VaR, CVaR, Sharpe, Sortino, vol, drawdown, ...) treat the
-  input as a return / P&L series. Pass ``as_returns=False`` on the level-based ones to
-  build a wealth index from a level/price series first.
-* annualisation is opt-in: pass ``periods_per_year`` (e.g. ``PERIODS_PER_YEAR_2H``);
-  when omitted no scaling is applied.
-
-Libraries imported: numpy, pandas, math, adv_validation (decimals-safe parsing +
-robust moments).
+Conventions: return/P&L metrics treat the input as returns — pass as_returns=False on
+the level-based ones. Annualisation is opt-in via periods_per_year.
 """
+
+# NOTE: parsing is delegated to adv_validation, so uint256 / RAY strings and the
+# 2**256-1 no-debt sentinel are handled the same as in the validation stage.
 
 import json
 import math
@@ -73,15 +60,11 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Shared primitives (parsing delegated to adv_validation — decimals-safe)
-# --------------------------------------------------------------------------- #
+# --- shared primitives (parsing delegated to adv_validation — decimals-safe) ---
 def _clean(data, column=None):
-    """Return a finite float64 array from a series-like or (df, column).
-
-    Uses ``adv._to_number`` / ``adv._numeric_pairs`` so big-int strings parse exactly;
-    None / non-numeric / the 2**256-1 sentinel and non-finite values are dropped.
-    """
+    """Finite float64 array from a series-like or (df, column).
+    Parsed with adv._to_number / adv._numeric_pairs so big-int strings stay exact.
+    Returns: np.ndarray; None, non-numeric, the 2**256-1 sentinel and non-finite values dropped."""
     if column is not None:
         _, vals = adv._numeric_pairs(data, column)        # (idx, parsed numbers)
     else:
@@ -103,6 +86,7 @@ def _moments(x):
 
 def to_returns(data, column=None, kind="simple"):
     """Period returns from a level series. ``kind`` is 'simple' (Δ/prev) or 'log'."""
+    # pct_change, so a zero level gives inf — callers on flow columns want as_returns=False
     x = _clean(data, column)
     if x.size < 2:
         return np.array([], dtype="float64")
@@ -135,11 +119,10 @@ def _ann(periods_per_year):
     return math.sqrt(periods_per_year) if periods_per_year else 1.0
 
 
-# --------------------------------------------------------------------------- #
-# Tail risk / downside
-# --------------------------------------------------------------------------- #
+# --- tail risk / downside ---
 def value_at_risk(data, column=None, level=0.95):
     """Historical VaR: the loss not exceeded with probability ``level`` (positive number)."""
+    # historical VaR, no distributional assumption — the sample IS the distribution here
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -148,6 +131,7 @@ def value_at_risk(data, column=None, level=0.95):
 
 def conditional_var(data, column=None, level=0.95):
     """Conditional VaR / Expected Shortfall: mean loss in the worst ``1-level`` tail."""
+    # CVaR is the average beyond VaR, which is what actually matters on these tails
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -158,6 +142,7 @@ def conditional_var(data, column=None, level=0.95):
 
 def tail_ratio(data, column=None, upper=0.95, lower=0.05):
     """|upper quantile| / |lower quantile| — right-vs-left tail asymmetry."""
+    # TODO: p95/p05 is arbitrary; try p99/p01 once there is more than a year of buckets
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -166,10 +151,9 @@ def tail_ratio(data, column=None, upper=0.95, lower=0.05):
 
 
 def hill_tail_index(data, column=None, k=None):
-    """Hill estimator of the (right) tail index α; lower α = heavier tail.
-
-    Uses the ``k`` largest positive order statistics (default ~10% of them).
-    """
+    """Hill estimator of the right tail index alpha; lower alpha = heavier tail.
+    data, k = number of largest positive order statistics (default ~10%).
+    Returns: float, or NaN with fewer than ~10 positive values."""
     x = _clean(data, column)
     x = np.sort(x[x > 0])
     n = x.size
@@ -185,6 +169,7 @@ def hill_tail_index(data, column=None, k=None):
 
 def downside_deviation(data, column=None, threshold=0.0):
     """Root-mean-square of shortfalls below ``threshold`` (Sortino denominator)."""
+    # NOTE: denominator is the FULL count, not just the downside rows
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -210,11 +195,10 @@ def semivariance(data, column=None):
     return float(np.mean((below - x.mean()) ** 2)) if below.size else 0.0
 
 
-# --------------------------------------------------------------------------- #
-# Drawdown (level / wealth-index based)
-# --------------------------------------------------------------------------- #
+# --- drawdown (level / wealth-index based) ---
 def max_drawdown(data, column=None, as_returns=False):
     """Largest peak-to-trough decline (fraction in [0, 1]); input order = time order."""
+    # needs a level series — pass as_returns=False on flow columns
     x = _clean(data, column)
     if x.size < 2:
         return np.nan
@@ -233,6 +217,7 @@ def average_drawdown(data, column=None, as_returns=False):
 
 def ulcer_index(data, column=None, as_returns=False):
     """Ulcer index — RMS of the percentage drawdown curve (depth + duration)."""
+    # rewards short shallow drawdowns over one long grinding one
     x = _clean(data, column)
     if x.size < 2:
         return np.nan
@@ -240,11 +225,10 @@ def ulcer_index(data, column=None, as_returns=False):
     return float(np.sqrt(np.nanmean(dd ** 2)))
 
 
-# --------------------------------------------------------------------------- #
-# Volatility / dispersion
-# --------------------------------------------------------------------------- #
+# --- volatility / dispersion ---
 def realized_volatility(data, column=None, periods_per_year=None, as_returns=True):
     """Std of returns, optionally annualised. ``as_returns=False`` diffs a level first."""
+    # one number for the whole series; use rolling_volatility for the per-row signal
     x = _clean(data, column) if as_returns else to_returns(data, column)
     if x.size < 2:
         return np.nan
@@ -252,20 +236,11 @@ def realized_volatility(data, column=None, periods_per_year=None, as_returns=Tru
 
 
 def rolling_volatility(data, column=None, window=12, min_periods=None, as_returns=False):
-    """Time-varying (rolling) standard deviation, ALIGNED to the input rows.
+    """Time-varying rolling std, ALIGNED to the input rows (not one number).
+    window, min_periods (default max(2, window // 3)), as_returns to diff into pct changes first.
+    Returns: pd.Series matching the input index; only the leading short rows are NaN."""
 
-    Unlike :func:`realized_volatility` (one number for the whole series) this returns a
-    pd.Series the same length/index as the input — its value at row t is the local
-    volatility of the preceding ``window`` observations. It is the signal used to label
-    each time bucket calm / normal / turbulent for a temporal-regime row split.
-
-    Position-aligned, so (unlike the other metrics) it does NOT drop rows via ``_clean``
-    — values are read with ``pd.to_numeric`` (the transformed frame is already numeric);
-    only the leading rows with fewer than ``min_periods`` observations are NaN.
-
-    ``as_returns=False`` measures volatility of the level/flow as-is; ``True`` takes
-    percentage changes first. ``min_periods`` defaults to ``max(2, window // 3)``.
-    """
+    # position-aligned, so this one does NOT drop rows via _clean — the frame is already numeric
     s = data[column] if column is not None else pd.Series(list(data))
     s = pd.to_numeric(s, errors="coerce")
     if as_returns:
@@ -278,6 +253,7 @@ def rolling_volatility(data, column=None, window=12, min_periods=None, as_return
 
 def robust_cv(data, column=None, method="mad"):
     """Outlier-resistant CV: 'mad' -> MAD/median, 'iqr' -> IQR/median."""
+    # IQR-based, so a single whale bucket cannot move it
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -317,9 +293,7 @@ def coefficient_of_variation(data, column=None):
     return float(np.std(x, ddof=1) / abs(x.mean()))
 
 
-# --------------------------------------------------------------------------- #
-# Distribution shape (robust moments reused from adv_validation)
-# --------------------------------------------------------------------------- #
+# --- distribution shape (robust moments reused from adv_validation) ---
 def moment_skewness(data, column=None):
     """Fisher-Pearson skewness (via adv._series_stats)."""
     return _moments(_clean(data, column))[0]
@@ -327,11 +301,13 @@ def moment_skewness(data, column=None):
 
 def excess_kurtosis(data, column=None):
     """Excess kurtosis (via adv._series_stats); 0 = Gaussian, >0 = fat-tailed."""
+    # > 3 is the heavy-tail flag the validation stage raises
     return _moments(_clean(data, column))[1]
 
 
 def bowley_skewness(data, column=None):
     """Quartile (Bowley) skewness in [-1, 1] — robust to outliers."""
+    # quartile-based, bounded in [-1, 1] — safer than moment skew on fat tails
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -374,6 +350,7 @@ def bimodality_coefficient(data, column=None):
 
 def jarque_bera(data, column=None):
     """Jarque-Bera normality statistic: (n/6)(S^2 + K^2/4); larger = less normal."""
+    # on 2h Aave buckets this rejects normality basically always; kept for the record
     x = _clean(data, column)
     n = x.size
     if n < 4:
@@ -384,11 +361,10 @@ def jarque_bera(data, column=None):
     return float(n / 6.0 * (s ** 2 + (k ** 2) / 4.0))
 
 
-# --------------------------------------------------------------------------- #
-# Concentration / inequality (non-negative magnitudes)
-# --------------------------------------------------------------------------- #
+# --- concentration / inequality (non-negative magnitudes) ---
 def gini_coefficient(data, column=None):
     """Gini in [0, 1] — 0 = perfectly even, 1 = fully concentrated. Negatives dropped."""
+    # non-negative magnitudes only — a negative flow makes this meaningless
     x = np.sort(_clean(data, column))
     x = x[x >= 0]
     n = x.size
@@ -401,6 +377,7 @@ def gini_coefficient(data, column=None):
 
 def herfindahl_index(data, column=None):
     """Herfindahl-Hirschman index = Σ shares² in [1/n, 1]; higher = more concentrated."""
+    # same inverse-HHI idea the PRI weight concentration check uses
     x = _clean(data, column)
     x = x[x >= 0]
     total = x.sum()
@@ -440,6 +417,7 @@ def theil_index(data, column=None):
 
 def top_k_concentration(data, column=None, k=0.01):
     """Share of total magnitude held by the largest ``k`` fraction of rows (k=0.01 -> top 1%)."""
+    # useful on whale dominance: what share of volume the biggest k buckets hold
     x = np.sort(_clean(data, column))[::-1]
     x = x[x >= 0]
     total = x.sum()
@@ -449,11 +427,10 @@ def top_k_concentration(data, column=None, k=0.01):
     return float(x[:m].sum() / total)
 
 
-# --------------------------------------------------------------------------- #
-# Risk-adjusted return (input treated as a return / P&L series)
-# --------------------------------------------------------------------------- #
+# --- risk-adjusted return (input treated as a return / P&L series) ---
 def sharpe_ratio(data, column=None, risk_free=0.0, periods_per_year=None):
     """(mean - rf) / std of returns, optionally annualised."""
+    # annualisation is opt-in — pass PERIODS_PER_YEAR_2H on the 2h grid
     x = _clean(data, column)
     if x.size < 2:
         return np.nan
@@ -463,6 +440,7 @@ def sharpe_ratio(data, column=None, risk_free=0.0, periods_per_year=None):
 
 def sortino_ratio(data, column=None, risk_free=0.0, periods_per_year=None):
     """(mean - rf) / downside deviation below ``risk_free``, optionally annualised."""
+    # Sharpe but punishing only downside vol, which fits liquidation flows better
     x = _clean(data, column)
     if x.size < 2:
         return np.nan
@@ -482,6 +460,7 @@ def calmar_ratio(data, column=None, periods_per_year=None, as_returns=True):
 
 def omega_ratio(data, column=None, threshold=0.0):
     """Omega = Σ gains above threshold / Σ losses below threshold."""
+    # NaN when nothing falls below the threshold — no denominator to divide by
     x = _clean(data, column)
     if x.size == 0:
         return np.nan
@@ -490,11 +469,10 @@ def omega_ratio(data, column=None, threshold=0.0):
     return float(gains / losses) if losses else np.nan
 
 
-# --------------------------------------------------------------------------- #
-# Dependence / memory (input order = time order)
-# --------------------------------------------------------------------------- #
+# --- dependence / memory (input order = time order) ---
 def autocorrelation(data, column=None, lag=1):
     """Lag-``lag`` autocorrelation of the series in row order."""
+    # lag-1 here is the thing the persistence baseline exploits
     x = _clean(data, column)
     if x.size <= lag + 1:
         return np.nan
@@ -506,6 +484,7 @@ def autocorrelation(data, column=None, lag=1):
 
 def hurst_exponent(data, column=None):
     """Rescaled-range (R/S) Hurst exponent: 0.5 random walk, >0.5 trending, <0.5 mean-reverting."""
+    # > 0.5 means trending, < 0.5 mean-reverting; needs a decent number of points
     x = _clean(data, column)
     n = x.size
     if n < 20:
@@ -532,40 +511,14 @@ def hurst_exponent(data, column=None):
     return float(np.polyfit(np.log(used), np.log(rs), 1)[0])
 
 
-# --------------------------------------------------------------------------- #
-# Cross-column structure (co-movement) — groups columns, not rows
-# --------------------------------------------------------------------------- #
+# --- cross-column structure (co-movement) — groups columns, not rows ---
 def correlation_clusters(df, columns=None, n_clusters=6, absolute=True,
                          method="pearson", linkage="complete"):
-    """Group columns into ``n_clusters`` by co-movement (agglomerative clustering).
+    """Group columns into n_clusters by co-movement (agglomerative, pure numpy/pandas).
+    columns, n_clusters, absolute (|corr| vs signed), method ('pearson'/'spearman'),
+    linkage ('complete' default / 'average' / 'single'). Returns: {"cluster_1": [...]}, largest first."""
 
-    Pure numpy/pandas (no scipy): builds a correlation matrix over ``columns``, turns it
-    into a distance ``d = 1 - |corr|`` (so strongly correlated columns are "close"),
-    then repeatedly merges the two closest clusters until ``n_clusters`` remain.
-    Columns that move together (redundant features) land together.
-
-    Parameters
-    ----------
-    columns : list[str] | None
-        Columns to cluster. Defaults to every numeric column.
-    n_clusters : int
-        Number of groups to cut to.
-    absolute : bool
-        Use ``|corr|`` (group columns that move together OR exactly opposite). Set
-        False to keep sign so anti-correlated columns stay apart.
-    method : str
-        Correlation method passed to ``DataFrame.corr`` ('pearson' / 'spearman').
-    linkage : str
-        Inter-cluster distance rule: ``'complete'`` (max pairwise distance; default —
-        compact, balanced clusters, avoids the chaining that makes ``'average'`` /
-        ``'single'`` collapse weakly-related columns into one mega-cluster),
-        ``'average'`` (mean), or ``'single'`` (min).
-
-    Returns
-    -------
-    dict[str, list[str]]
-        ``{"cluster_1": [...], ...}``, ordered largest cluster first.
-    """
+    # 'complete' by default: 'average'/'single' chain weakly-related columns into one mega-cluster
     cols = (list(columns) if columns is not None
             else df.select_dtypes("number").columns.tolist())
     X = df[cols].apply(pd.to_numeric, errors="coerce")
@@ -599,16 +552,11 @@ def correlation_clusters(df, columns=None, n_clusters=6, absolute=True,
     return {f"cluster_{k + 1}": [cols[m] for m in g] for k, g in enumerate(groups)}
 
 
-# --------------------------------------------------------------------------- #
-# Convenience — run every metric over one column
-# --------------------------------------------------------------------------- #
+# --- convenience: run every metric over one column ---
 def financial_metrics(data, column=None, periods_per_year=None, as_returns=True):
-    """Return a {metric_name: value} dict of all metrics for one column/series.
-
-    ``as_returns`` tells the return/drawdown metrics whether the input is already a
-    return series (True) or a level/price series (False, in which case it is diffed
-    or turned into a wealth index first).
-    """
+    """Every metric for one column/series in one dict.
+    data, as_returns: True if already returns, False to diff / build a wealth index first.
+    Returns: {metric_name: float}."""
     levels = data if column is None else data
     rets = (_clean(data, column) if as_returns else to_returns(data, column))
 
@@ -651,25 +599,17 @@ def financial_metrics(data, column=None, periods_per_year=None, as_returns=True)
     }
 
 
-# --------------------------------------------------------------------------- #
-# Shared column-priority map (file-backed → live across notebooks)
-# --------------------------------------------------------------------------- #
-# A {column: score} map you tune as the EDA progresses (raise / lower a column's
-# priority). It is persisted to ONE JSON file so every notebook in this directory
-# reads and writes the SAME map: a change made in one notebook is picked up by
-# another the next time it calls get_priorities() / get_priority() — each call reads
-# the file fresh, so there is no in-process copy to go stale. The path is anchored to
-# the repo root (parent of src/), so it resolves identically regardless of a notebook's CWD.
+# --- shared column-priority map (file-backed, live across notebooks) ---
+# ONE JSON file at the repo root, so a score changed in one notebook is picked up by the
+# next get_priorities() call elsewhere — every call re-reads, no in-process copy to go stale.
 PRIORITY_PATH = Path(__file__).resolve().parent.parent / "column_priority.json"
 DEFAULT_PRIORITY = 0.0
 
 
 def load_priorities(path=PRIORITY_PATH):
-    """Read the shared ``{column: score}`` map from disk (the single source of truth).
-
-    Returns an empty dict if the file is missing or unreadable, so a fresh project
-    just starts empty.
-    """
+    """Read the shared {column: score} map from disk (the single source of truth).
+    No arguments; path anchored to the repo root.
+    Returns: dict — empty when the file is missing or unreadable."""
     path = Path(path)
     if not path.exists():
         return {}
@@ -682,16 +622,12 @@ def load_priorities(path=PRIORITY_PATH):
 
 
 def _save_priorities(scores, path=PRIORITY_PATH):
-    """Write the map atomically (temp file + replace) so a concurrent reader in another
-    notebook never sees a half-written file.
+    """Write the priority map atomically (temp file + replace).
+    mapping -> falls back to an in-place write when the rename is refused.
+    Returns: None."""
 
-    Falls back to an in-place write when the rename is refused. Docker implements a
-    SINGLE-FILE bind mount by mounting that file's inode at the target path, and a
-    mount point cannot be renamed over — ``tmp.replace(path)`` raises
-    ``OSError: [Errno 16] Device or resource busy``. The fallback gives up
-    atomicity (a crash mid-write could truncate the file) but keeps the function
-    working inside a container; the atomic path is still used everywhere else.
-    """
+    # the fallback exists for Docker single-file bind mounts: the target is a mount point,
+    # so tmp.replace(path) raises Errno 16. Loses atomicity, keeps the container working.
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     payload = {str(k): float(v) for k, v in scores.items()}
@@ -706,11 +642,9 @@ def _save_priorities(scores, path=PRIORITY_PATH):
 
 
 def get_priorities(path=PRIORITY_PATH):
-    """The priority map as a DataFrame ``[column, score]``, highest score first.
-
-    Reads the file on every call, so the frame always reflects edits made in other
-    notebooks. Assign it (``priority_df = eda.get_priorities()``) and re-run to refresh.
-    """
+    """The priority map as a DataFrame [column, score], highest first.
+    Reads the file on every call, so it reflects edits from other notebooks.
+    Returns: DataFrame. Re-assign and re-run to refresh."""
     scores = load_priorities(path)
     df = pd.DataFrame(list(scores.items()), columns=["column", "score"])
     return df.sort_values("score", ascending=False, kind="stable").reset_index(drop=True)
@@ -718,11 +652,13 @@ def get_priorities(path=PRIORITY_PATH):
 
 def get_priority(column, path=PRIORITY_PATH, default=DEFAULT_PRIORITY):
     """Current score for one column (``default`` if it is not in the map yet)."""
+    # reads the file every call, so another notebook's edit shows up immediately
     return load_priorities(path).get(str(column), default)
 
 
 def set_priority(column, score, path=PRIORITY_PATH):
     """Set a column's ABSOLUTE score, persist, and return the refreshed map DataFrame."""
+    # writes through to the shared JSON — this is visible to every other notebook
     scores = load_priorities(path)
     scores[str(column)] = float(score)
     _save_priorities(scores, path)
@@ -752,6 +688,7 @@ def register_columns(columns, default=DEFAULT_PRIORITY, path=PRIORITY_PATH, over
 def bump_priority(column, by=1.0, path=PRIORITY_PATH, default=DEFAULT_PRIORITY):
     """Add ``by`` to a column's score (negative lowers it); creates it at ``default`` first
     if unseen. Returns the refreshed map df."""
+    # TODO: no upper clamp on the score yet
     scores = load_priorities(path)
     scores[str(column)] = scores.get(str(column), default) + float(by)
     _save_priorities(scores, path)
@@ -778,5 +715,6 @@ def remove_priority(column, path=PRIORITY_PATH):
 
 def reset_priorities(path=PRIORITY_PATH):
     """Clear the entire map (writes an empty file). Returns the (empty) map df."""
+    # wipes the shared map for every notebook, not just this one
     _save_priorities({}, path)
     return get_priorities(path)

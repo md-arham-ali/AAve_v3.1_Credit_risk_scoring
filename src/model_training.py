@@ -1,11 +1,7 @@
 """Modeling stage — model runners (the training pass) + the PRI meta-learner.
 
-One runner per model kind: tuned classifiers/regressors, the two baseline families,
-IsolationForest, Cox PH survival, and the LSTM / Temporal Transformer sequence
-classifiers — each reporting train/val/test with a bootstrap test-AUC CI. The
-meta-learner blends every trained component's rank-normalized score (skill-shrunk
-weights, baselines excluded) into the Protocol Risk Index. Orchestrated by
-notebooks/model_training.ipynb.
+One runner per kind: tuned classifiers/regressors, baselines, IsolationForest, Cox PH,
+and the LSTM / Temporal Transformer sequence classifiers.
 """
 
 import os, sys
@@ -53,11 +49,10 @@ def _prediction_frame(data, scores_by_split, y_by_split):
 def run_classifier(name, data, targets=STRESS_TARGETS, cv_target="y_stress_1d",
                    params=None, tune=True):
     """Tune (walk-forward, train-only), fit per stress horizon, report train/val/test.
+    spec, data bundle, cv_target -> F1 at the VAL-optimal threshold, reused on test.
+    Returns: result dict; cv_target test AUC carries a block-bootstrap CI."""
 
-    F1 is computed at the VAL-optimal threshold (stored per target, reused on test).
-    Train metrics expose the overfit gap; the test ROC-AUC of cv_target gets a
-    block-bootstrap CI. The cv_target full-timeline scores are the PRI component.
-    """
+    # cv_target's full-timeline scores are what the PRI blend consumes
     spec = CLASSIFIER_SPECS[name]
     xkey = "scaled" if spec["scaled"] else "raw"
     X = data["X"][xkey]
@@ -97,9 +92,8 @@ def run_classifier(name, data, targets=STRESS_TARGETS, cv_target="y_stress_1d",
 
 def run_regressor(name, data, target=REG_TARGET, params=None, tune=True):
     """Tune (walk-forward, train-only), fit on log1p volume, report train/val/test.
-
-    mae_usd back-transform is clipped to the train target max (no expm1 blow-ups).
-    """
+    spec, data bundle.
+    Returns: result dict; mae_usd back-transform clipped to the train target max."""
     spec = REGRESSOR_SPECS[name]
     xkey = "scaled" if spec["scaled"] else "raw"
     X = data["X"][xkey]
@@ -129,11 +123,8 @@ def run_regressor(name, data, target=REG_TARGET, params=None, tune=True):
 
 def run_baseline_classifiers(data, cv_target="y_stress_1d"):
     """Two no-model references per stress target: persistence and prevalence.
-
-    persistence — score = today's same-day stress flag (liquidation autocorrelation
-    is the thing to beat); prevalence — constant train positive rate (AUC 0.5 anchor).
-    Persistence's cv_target scores join the PRI component pool on equal terms.
-    """
+    persistence = today's stress flag; prevalence = constant train positive rate (AUC 0.5 anchor).
+    Returns: result dict. Persistence joins the PRI component pool on equal terms."""
     out = []
     for base in ("persistence", "prevalence"):
         res = {"name": f"baseline_{base}", "kind": "classifier", "status": "trained",
@@ -182,11 +173,8 @@ def run_baseline_regressors(data, target=REG_TARGET):
 
 def run_isolation_forest(data, contamination="auto"):
     """Unsupervised anomaly model: fit on TRAIN features only, no labels.
-
-    Anomaly score = 1 - ECDF_train(score_samples) in [0, 1] (higher = more anomalous),
-    evaluated as a pseudo-classifier against every stress target (rank metrics only —
-    Brier is approximate for an uncalibrated score).
-    """
+    Anomaly score = 1 - ECDF_train(score_samples), higher = more anomalous.
+    Returns: result dict with rank metrics only — Brier is meaningless here."""
     X = data["X"]["raw"]
     model = IsolationForest(n_estimators=400, contamination=contamination,
                             random_state=RANDOM_STATE, n_jobs=-1)
@@ -211,10 +199,8 @@ def run_isolation_forest(data, contamination="auto"):
 
 def build_survival_frame(times, stress_flags):
     """Per-day survival target: days until the NEXT same-day stress day.
-
-    duration = calendar days from t (exclusive) to the next stress day; event = 1.
-    Days after the last stress day are right-censored at the panel end (event = 0).
-    """
+    df, stress col -> duration in calendar days from t (exclusive), event = 1.
+    Returns: the survival frame; days after the last stress day are right-censored."""
     days = pd.to_datetime(pd.Series(times).astype(str).str.replace(" UTC", "", regex=False))
     flags = np.asarray(stress_flags).astype(int)
     stress_idx = np.flatnonzero(flags)
@@ -232,12 +218,10 @@ def build_survival_frame(times, stress_flags):
 
 def run_cox(data, penalizer=0.10, top_n_features=15):
     """Cox proportional-hazards on time-to-next-stress-day (lifelines, optional).
+    Features = top-N by seeded RandomForest importance, scaled; C-index on val/test.
+    Returns: result dict, or a skipped-result dict if lifelines is absent or the fit diverges."""
 
-    Features = top-N by a seeded RandomForest importance (collinearity control on
-    ~250 rows), scaled. C-index on val/test; the rank-normalized partial hazard is
-    the survival PRI component. Returns a skipped-result dict when lifelines is
-    missing or the fit fails to converge.
-    """
+    # top-N is collinearity control — there are only ~250 rows to fit on
     if not LIFELINES_AVAILABLE:
         print(" cox: SKIPPED — lifelines not installed")
         return {"name": "cox_ph", "kind": "survival", "status": "skipped",
@@ -307,11 +291,8 @@ def run_lstm(data, target="y_stress_1d", lookback=14, hidden=32, epochs=200,
 def run_transformer(data, target="y_stress_1d", lookback=14, d_model=32, n_heads=4,
                     n_layers=2, epochs=200, lr=1e-3, patience=20):
     """Temporal Transformer classifier on 14-day windows (torch, optional).
-
-    A learned input projection + additive positional embedding feeds a small
-    TransformerEncoder; the last position's representation is the classification
-    head input — the plan.md temporal-attention counterpart to the LSTM.
-    """
+    Learned input projection + additive positional embedding -> small TransformerEncoder.
+    Returns: result dict. The last position's representation feeds the classification head."""
     return _run_sequence_model(data, arch="transformer", target=target,
                                lookback=lookback, hidden=d_model, n_heads=n_heads,
                                n_layers=n_layers, epochs=epochs, lr=lr, patience=patience)
@@ -320,20 +301,16 @@ def run_transformer(data, target="y_stress_1d", lookback=14, d_model=32, n_heads
 def _run_sequence_model(data, arch, target="y_stress_1d", lookback=14, hidden=32,
                         n_heads=4, n_layers=2, epochs=200, lr=1e-3, patience=20):
     """Shared torch training loop for the sequence classifiers (LSTM / Transformer).
+    Windows only look BACK, each sequence belongs to the split of its END day; early stop on val BCE.
+    Returns: result dict, or a skipped-result dict when torch is missing."""
 
-    Sequences are built over the stacked timeline (windows only ever look BACK, so
-    a window crossing a split boundary uses past features only — no label leakage;
-    the embargo gap days simply appear as a jump inside those windows). Each
-    sequence belongs to the split of its END day. Early stopping on val BCE.
-    Returns a skipped-result dict when torch is missing.
-    """
+    # a window crossing a split boundary is safe — the embargo gap just shows up as a jump
     if not TORCH_AVAILABLE:
         print(f" {arch}: SKIPPED — torch not installed")
         return {"name": arch, "kind": "classifier", "status": "skipped",
                 "reason": "torch not installed"}
-    # macOS: xgboost/lightgbm already loaded Homebrew's libomp in this process;
-    # torch ships its own OpenMP copy and the duo deadlocks on first tensor op
-    # unless the duplicate runtime is allowed and torch stays single-threaded.
+    # macOS: xgboost/lightgbm already loaded Homebrew's libomp, and torch ships its own —
+    # the duo deadlocks on the first tensor op unless the dup is allowed and torch is single-threaded.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     import torch
     from torch import nn
@@ -436,10 +413,8 @@ def _run_sequence_model(data, arch, target="y_stress_1d", lookback=14, hidden=32
 
 def _component_skill(res, target="y_stress_1d"):
     """A component's skill for meta-weighting: mean of val AUC and train CV AUC.
-
-    Averaging the two independent estimates halves the variance of a val AUC read
-    off ~8 positives; survival components use the val C-index (no CV available).
-    """
+    result dict -> survival components fall back to the val C-index.
+    Returns: float. Averaging two estimates halves the variance of a val AUC read off ~8 positives."""
     if res.get("status") != "trained":
         return None
     if res["kind"] == "survival":
@@ -463,11 +438,10 @@ def _is_meta_component(res):
 
 def fit_meta_weights(results, target="y_stress_1d", floor=0.02, shrink=0.30):
     """Skill-proportional weights, floored and shrunk toward equal weights.
+    w_i proportional to (1-shrink)*max(skill_i - 0.5, floor) + shrink*(1/n).
+    Returns: {component: weight}."""
 
-    w_i ∝ (1-shrink)·max(skill_i − 0.5, floor) + shrink·(1/n). The floor keeps
-    weak-but-trained components alive and the shrinkage stops the 53-row val split
-    from zeroing 11/14 models on AUC noise (a fitted stacker would overfit worse).
-    """
+    # without the shrink the 53-row val split zeroes 11/14 models on pure AUC noise
     raw = {}
     for res in results.values():
         if not _is_meta_component(res):
@@ -486,11 +460,9 @@ def fit_meta_weights(results, target="y_stress_1d", floor=0.02, shrink=0.30):
 
 
 def compute_pri(score_frame, weights):
-    """PRI = 100 × weighted mean of the rank-normalized component columns.
-
-    NaN components (e.g. LSTM warm-up days) are excluded per-row via a
-    weight-renormalized mean.
-    """
+    """PRI = 100 * weighted mean of the rank-normalized component columns.
+    component frame, weights -> NaN components excluded per row, weights renormalized.
+    Returns: the PRI Series."""
     cols = [c for c in weights if c in score_frame.columns]
     w = np.array([weights[c] for c in cols])
     vals = score_frame[cols].to_numpy(dtype=float)
@@ -502,11 +474,8 @@ def compute_pri(score_frame, weights):
 
 def run_meta_pri(results, data, target="y_stress_1d"):
     """The meta-learner: blend every trained component score into the PRI series.
-
-    Each component's full-timeline scores are rank-normalized against its TRAIN
-    values, weighted by validation skill, and averaged to a 0-100 index. Evaluated
-    like any classifier against the stress targets on test.
-    """
+    Components rank-normalized against their TRAIN values, weighted by val skill, averaged to 0-100.
+    Returns: result dict, evaluated like any classifier against the stress targets on test."""
     frame = None
     for res in results.values():
         if not _is_meta_component(res):

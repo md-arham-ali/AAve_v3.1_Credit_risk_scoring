@@ -1,14 +1,6 @@
-"""Backfill preserved model_results_* folders into MLflow as historical runs.
+"""Backfill preserved model_results_* folders into MLflow as historical runs (one-off).
 
-One-off. Each preserved folder is a complete pipeline run whose results would
-otherwise only exist as files — this replays them into MLflow so past split
-configurations are comparable in the UI alongside future runs.
-
-Every run is tagged `source=backfill` plus the folder it came from, so backfilled
-history is never mistaken for a live run.
-
-Run inside the credit-risk-model container (it has both mlflow and src/ on the
-path), with the tracking server already up:
+Every run is tagged source=backfill plus its folder, so it is never mistaken for a live run.
 
     docker compose up -d mlflow
     docker compose run --rm credit-risk-model python /app/scripts/backfill_mlflow.py
@@ -24,9 +16,7 @@ import mlflow_tracking as mt
 from model_persistence import load_model_results
 
 
-# folder -> the tags that describe what that run WAS. Recorded explicitly rather
-# than parsed from the name, because the names are informal and one of them
-# understates what actually happened (see the embargo note below).
+# Tags recorded explicitly, not parsed from the folder names — the names are informal.
 BACKFILL_RUNS = {
     "model_results_20260721_70-15-15": {
         "split": "70/15/15",
@@ -36,10 +26,8 @@ BACKFILL_RUNS = {
     "model_results_20260729_55-25-25": {
         "split": "55/25/25",
         "embargo_days": "1",
-        # The folder's own model_split_meta recorded 7 because the split notebook
-        # wrote cfg.EMBARGO instead of the value it actually passed. The real gap
-        # was 1 day, so labels near the boundary overlapped val and every val
-        # metric in this run is inflated. Tagged so the UI cannot mislead.
+        # WARNING: this folder's meta says embargo 7 but the real gap was 1 day, so
+        # its val metrics are inflated. Tagged so the UI cannot mislead.
         "note": "embargo actually 1 despite meta saying 7 — val metrics inflated",
     },
 }

@@ -1,10 +1,4 @@
-"""Modeling stage — chronological split, thresholds, feature transform, leakage guards.
-
-Embargoed 70/15/15 chronological split, per-horizon train-quantile stress
-thresholds, the train-fit feature transform (log1p heavy tails, drop near-constants)
-and scaler, the leakage asserts, and the embargoed walk-forward CV fold indices.
-Orchestrated by notebooks/model_split.ipynb.
-"""
+"""Modeling stage — chronological split, stress thresholds, feature transform, leakage guards."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,12 +14,10 @@ from model_config import (TIME_COL, HORIZONS, REG_TARGET, STRESS_TARGETS,
 
 def chronological_split(df, fractions=SPLIT_FRACTIONS, time_col=TIME_COL, embargo=EMBARGO):
     """Chronological train/val/test split with an embargo before each boundary.
+    df, fractions, embargo (= max horizon) -> last embargo rows of train and val dropped.
+    Returns: {split: frame}; test keeps every row."""
 
-    The last `embargo` (= max horizon) rows of train and of val are DROPPED: their
-    forward-max labels read days inside the next split, so keeping them leaks
-    val/test outcomes into training labels. Test keeps every row (its trailing
-    incomplete windows were already trimmed in add_forward_targets).
-    """
+    # those dropped rows' fwd-max labels read days inside the next split — straight leakage
     out = df.sort_values(time_col, kind="stable").reset_index(drop=True)
     n = len(out)
     n_train = int(n * fractions[0])
@@ -41,12 +33,11 @@ def chronological_split(df, fractions=SPLIT_FRACTIONS, time_col=TIME_COL, embarg
 
 
 def compute_stress_thresholds(train_df, quantile=STRESS_QUANTILE, horizons=HORIZONS):
-    """Train-only threshold PER HORIZON: the p-quantile of that horizon's fwd max.
+    """Train-only stress threshold PER HORIZON: the p-quantile of that horizon's fwd max.
+    train frame, horizons, quantile -> one threshold each.
+    Returns: {horizon: float}, keeping every target near (1-q) positives."""
 
-    One shared daily threshold made y_stress_7d ~76% positive (a fwd-7d max beats a
-    daily p75 most of the time); quantiling each horizon's own fwd-max distribution
-    keeps every target at ~(1-q) positives on train, so horizons stay comparable.
-    """
+    # NOTE: one shared daily threshold used to make y_stress_7d ~76% positive
     out = {}
     for h in horizons:
         out[h] = float(train_df[f"target_fwd_max_{h}d"].astype(float).quantile(quantile))
@@ -57,10 +48,8 @@ def compute_stress_thresholds(train_df, quantile=STRESS_QUANTILE, horizons=HORIZ
 
 def binarize_targets(splits, thresholds, horizons=HORIZONS):
     """Add y_stress_{h}d to every split using the TRAIN thresholds only.
-
-    y_stress_{h}d = 1 when the forward max over the next h days exceeds the train
-    threshold. Returns a positive-rate table (split x horizon) for the balance check.
-    """
+    splits, thresholds -> 1 when the forward h-day max exceeds the train threshold.
+    Returns: a positive-rate table (split x horizon) for the balance check."""
     rows = []
     for name, part in splits.items():
         row = {"split": name, "n": len(part)}
@@ -74,13 +63,11 @@ def binarize_targets(splits, thresholds, horizons=HORIZONS):
 
 def fit_feature_transform(train_df, columns, skew_threshold=SKEW_LOG1P_THRESHOLD,
                           near_constant_frac=NEAR_CONSTANT_FRAC):
-    """Train-fit column transform: log1p for heavy right tails, drop near-constants.
+    """Train-fit column transform: log1p heavy right tails, drop near-constants.
+    train frame, skew_threshold, near_constant_frac.
+    Returns: {log1p_cols, dropped} — the persisted transform every runner replays."""
 
-    log1p_cols: non-negative columns whose train skew exceeds skew_threshold —
-    linear/KNN/SVM/MLP inputs stop being dominated by a few extreme days (the
-    regression TARGET was already logged; the features were not).
-    dropped: columns whose most frequent train value covers > near_constant_frac.
-    """
+    # the regression target was already logged; the features were not, which skewed KNN/SVM/MLP
     log1p_cols, dropped, kept = [], [], []
     for c in columns:
         s = train_df[c].astype(float)
@@ -107,10 +94,8 @@ def apply_feature_transform(df, transform):
 
 def fit_scaler(train_df, columns):
     """Per-column mean/std/median from TRAIN only (std 0 -> 1 guard).
-
-    The medians double as the null-imputation values, so no global statistic ever
-    touches val/test.
-    """
+    train frame, feature_cols.
+    Returns: {mean, std, median}; the medians double as null-imputation values."""
     params = {}
     for c in columns:
         s = train_df[c].astype(float)
@@ -123,10 +108,8 @@ def fit_scaler(train_df, columns):
 
 def apply_scaler(df, params, columns=None, standardize=True):
     """Median-impute (train medians) and optionally standardize a copy of the frame.
-
-    standardize=False gives the tree/NB input (imputed, unscaled); True gives the
-    input for scale-sensitive models (KNN/SVM/MLP/linear).
-    """
+    df, scaler_params, standardize -> False for trees/NB, True for KNN/SVM/MLP/linear.
+    Returns: a new DataFrame."""
     cols = list(params) if columns is None else list(columns)
     out = df[cols].astype(float).copy()
     for c in cols:
@@ -138,12 +121,9 @@ def apply_scaler(df, params, columns=None, standardize=True):
 
 
 def assert_no_leakage(splits, time_col=TIME_COL, embargo=EMBARGO):
-    """Hard-assert split ordering, target completeness AND the label embargo.
-
-    The embargo check: at least `embargo` calendar days must separate the last
-    train/val row from the next split's first row, so no kept row's fwd-max window
-    can reach across a boundary.
-    """
+    """Hard-assert split ordering, target completeness, and the label embargo.
+    splits, embargo -> raises AssertionError on any violation.
+    Returns: None. At least `embargo` days must separate a split's last row from the next's first."""
     tr, va, te = splits["train"], splits["val"], splits["test"]
     assert tr[time_col].max() < va[time_col].min() < va[time_col].max() < te[time_col].min(), \
         "split time ranges overlap"
@@ -163,10 +143,8 @@ def assert_no_leakage(splits, time_col=TIME_COL, embargo=EMBARGO):
 
 def walk_forward_indices(n, n_splits=N_CV_SPLITS, embargo=EMBARGO):
     """Expanding-window walk-forward folds with the same label embargo inside CV.
-
-    The last `embargo` rows of every fold's train slice are dropped — their fwd-max
-    labels read days inside the fold's test slice (the in-fold copy of ERR-23).
-    """
+    n_rows, n_folds, embargo -> last embargo rows of each fold's train slice dropped.
+    Returns: [(train_idx, test_idx), ...] — the in-fold copy of the ERR-23 fix."""
     folds = []
     for tr_idx, te_idx in TimeSeriesSplit(n_splits=n_splits).split(np.arange(n)):
         folds.append((tr_idx[:-embargo] if embargo else tr_idx, te_idx))

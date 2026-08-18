@@ -1,11 +1,4 @@
-"""Modeling stage — result persistence and the training-data bundle loader.
-
-Saves/loads each model result (metrics JSON + full-timeline predictions CSV),
-writes the run manifest (provenance: timestamp, library versions, split shapes,
-transform), and assembles the ``load_model_data`` bundle every runner consumes
-(applies the persisted train-fit transform + scaler). Consumed by the training
-and results notebooks.
-"""
+"""Modeling stage — result persistence, run manifest, and the training-data bundle loader."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,9 +31,8 @@ def _json_safe(obj):
 
 def save_model_result(result, out_dir=MODEL_RESULTS_DIR):
     """Persist one model's result: metrics JSON + full-timeline predictions CSV.
-
-    Files keyed name__kind so same-named classifier/regressor pairs never collide.
-    """
+    result dict + out_dir -> two files keyed name__kind.
+    Returns: the written paths. Keyed so classifier/regressor pairs never collide."""
     folder = Path(out_dir)
     folder.mkdir(parents=True, exist_ok=True)
     stem = f"{result['name']}__{result.get('kind', 'model')}"
@@ -55,11 +47,11 @@ def save_model_result(result, out_dir=MODEL_RESULTS_DIR):
 
 
 def write_run_manifest(data, out_dir=MODEL_RESULTS_DIR, extra=None):
-    """Persist run provenance next to the results: when, library versions, shapes.
+    """Write run provenance beside the results: timestamp, lib versions, split shapes.
+    out_dir + run metadata -> manifest JSON.
+    Returns: the manifest path."""
 
-    model_results/ contents are only trustworthy when this manifest matches the
-    run that produced them (the old training run left no executed trace at all).
-    """
+    # model_results/ is only trustworthy when this manifest matches the run that made it.
     import datetime
     import sklearn
     import xgboost
@@ -103,14 +95,9 @@ def load_model_results(out_dir=MODEL_RESULTS_DIR):
 
 
 def load_model_data(data_dir="transformed_data"):
-    """Load the split CSVs + meta into the training bundle used by every runner.
-
-    Applies the persisted train-fit feature transform (log1p heavy tails, drop
-    near-constants) before scaling. Returns {splits, frames_t, feature_cols,
-    thresholds, scaler_params, transform, X: {raw, scaled}, y, times, stress} —
-    raw = transformed + train-median-imputed, scaled = + train-standardized;
-    frames_t are the transformed split frames (targets kept) for in-fold refits.
-    """
+    """Load the split CSVs + meta into the bundle every runner consumes.
+    Applies the persisted train-fit transform (log1p heavy tails, drop near-constants), then scales.
+    Returns: {splits, frames_t, feature_cols, thresholds, scaler_params, transform, X: {raw, scaled}, y, times, stress}."""
     folder = Path(data_dir)
     meta = json.load(open(folder / "model_split_meta.json"))
     transform = meta["feature_transform"]

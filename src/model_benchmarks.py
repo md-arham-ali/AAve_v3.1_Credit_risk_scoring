@@ -1,10 +1,4 @@
-"""Modeling stage — read-side benchmarks over the saved model results.
-
-Per-model scorecards, per-horizon leaderboards, aggregated tree-ensemble feature
-importances, PRI weight concentration, the VAL-selected champion, riskiest-days
-(next-day outcome), and the test-only lead-time backtest. No fitting here — pure
-analysis of ``model_results/``. Orchestrated by notebooks/model_results.ipynb.
-"""
+"""Modeling stage — read-side benchmarks over the saved model_results/. No fitting here."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,12 +13,8 @@ from model_config import STRESS_TARGETS, TARGET_BASE_COL, TIME_COL
 
 def model_scorecard(result):
     """Per-model benchmark table (val + test) for one result dict.
-
-    One tidy frame per model so a single ``display(model_scorecard(res))`` shows
-    that model's benchmark in isolation — classifiers/anomaly/meta report the rank
-    metrics per horizon, regressors the error metrics, survival the C-index. Skipped
-    or failed models return a one-row status frame instead of raising.
-    """
+    result -> rank metrics per horizon (classifier/anomaly/meta), error metrics, or C-index.
+    Returns: a tidy DataFrame; skipped/failed models give a one-row status frame."""
     kind = result.get("kind", "model")
     if result.get("status") != "trained":
         return pd.DataFrame([{"model": result.get("name"), "kind": kind,
@@ -71,12 +61,9 @@ def model_scorecard(result):
 
 
 def weight_concentration(weights):
-    """Diagnostic for how concentrated the PRI blend is.
-
-    Reports the effective number of components (1 / Σwᵢ², the inverse Herfindahl
-    index) and the single largest weight — a low effective-N warns the index is
-    really driven by one or two models rather than the full zoo.
-    """
+    """How concentrated the PRI blend is.
+    weights -> inverse Herfindahl (1 / sum wi^2) plus the largest single weight.
+    Returns: dict. Low effective-N means the index rides on one or two models."""
     w = np.array([v for v in weights.values() if v > 0], dtype=float)
     if w.size == 0:
         return {"n_nonzero": 0, "effective_n": 0.0, "max_weight": 0.0}
@@ -87,12 +74,9 @@ def weight_concentration(weights):
 
 
 def build_leaderboard(results, kind="classification", split="test"):
-    """One row per model (× horizon for classification), sorted by the lead metric.
-
-    kind="classification" covers classifier/anomaly/meta results; "regression"
-    the regressors; "survival" the Cox C-index. Skipped models appear with their
-    status so the roster stays visible.
-    """
+    """One row per model (x horizon for classification), sorted by the lead metric.
+    results, kind: "classification" | "regression" | "survival".
+    Returns: DataFrame; skipped models appear with their status so the roster stays visible."""
     rows = []
     if kind == "classification":
         for res in results.values():
@@ -140,10 +124,8 @@ def aggregate_feature_importances(results, top_n=15,
                                   models=("random_forest", "extra_trees",
                                           "xgboost", "lightgbm")):
     """Mean of sum-normalized native importances across the tree ensembles.
-
-    ⚠️ hist_gradient_boosting has no native importances and linear |coef| lives on
-    a different scale — both excluded by default.
-    """
+    results, optional model filter.
+    Returns: DataFrame. hist_gradient_boosting and linear |coef| excluded by default."""
     per_model = {}
     for name in models:
         imp = results.get(f"{name}__classifier", results.get(name, {})).get("importances")
@@ -158,11 +140,9 @@ def aggregate_feature_importances(results, top_n=15,
 
 
 def select_champion(results, target="y_stress_1d", split="val", exclude=("meta_pri",)):
-    """Best single model chosen on the VAL split (never on test — selection bias).
-
-    Returns (name, val_metric_dict, test_metric_dict) among trained
-    classifier/anomaly components, baselines included so a model must beat them.
-    """
+    """Best single model chosen on VAL (never test — selection bias).
+    results, horizon -> searches trained classifier/anomaly components, baselines included.
+    Returns: (name, val_metrics, test_metrics)."""
     best_name, best_val = None, -np.inf
     for res in results.values():
         if res.get("kind") not in ("classifier", "anomaly") or res.get("status") != "trained":
@@ -182,12 +162,9 @@ def select_champion(results, target="y_stress_1d", split="val", exclude=("meta_p
 
 
 def riskiest_days(pri_frame, panel, k=10, target_col=TARGET_BASE_COL, time_col=TIME_COL):
-    """Top-k days by PRI with the realized NEXT-day liquidation outcome alongside.
-
-    PRI at day t predicts t+1, so the outcome column is target_col shifted back one
-    day (next_day_{target_col}) — showing the same-day value would validate the
-    wrong prediction.
-    """
+    """Top-k days by PRI with the realized NEXT-day outcome alongside.
+    pri frame, target_col, k -> outcome is target_col shifted back one day.
+    Returns: DataFrame. PRI at t predicts t+1, so the same-day value would be the wrong check."""
     outcome = panel[[time_col, target_col]].sort_values(time_col, kind="stable").copy()
     outcome[f"next_day_{target_col}"] = outcome[target_col].astype(float).shift(-1)
     merged = pri_frame.merge(
@@ -199,21 +176,12 @@ def riskiest_days(pri_frame, panel, k=10, target_col=TARGET_BASE_COL, time_col=T
 
 def lead_time_backtest(pri_frame, stress_flags, alert_quantile=0.90, max_lead=7,
                        eval_splits=("test",), time_col=TIME_COL):
-    """How early does the PRI flag real stress episodes? (plan.md lead-time analogue)
+    """How early the PRI flags real stress episodes.
+    Alert cut = train PRI quantile; events = episode starts in eval_splits (TEST only by default).
+    Returns: (events_table, summary_dict) with lead days and the false-alert rate."""
 
-    Alert threshold = train-split PRI quantile. Events = stress-EPISODE starts (a
-    stress day preceded by a calm day — consecutive stress days count once) inside
-    eval_splits. For each event: was any of the preceding max_lead days an alert
-    day, and how many days before the event did the first alert fire? Also reports
-    the false-alert rate (alert days in eval_splits with no stress within max_lead).
-
-    eval_splits defaults to TEST ONLY: val fit the meta weights and early-stopped
-    the sequence models, so scoring it here would grade tuning data. A lead equal
-    to max_lead usually means the window is saturated by persistent alerts —
-    compare n_alert_days against the split length before quoting it.
-
-    Returns (events_table, summary_dict).
-    """
+    # a lead equal to max_lead usually means persistent alerts saturated the window —
+    # check n_alert_days against the split length before quoting it
     f = pri_frame.sort_values(time_col, kind="stable").reset_index(drop=True)
     pri = f["score"].to_numpy(dtype=float)
     split = f["split"].to_numpy()
