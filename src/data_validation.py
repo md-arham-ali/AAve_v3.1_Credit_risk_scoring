@@ -11,8 +11,17 @@ from pathlib import Path
 import pandas as pd
 
 # Friendly result names per Dune query id (falls back to query_<id> otherwise).
+# query id -> table label. A label must be UNIQUE here: transform.latest_paths() resolves
+# per query id and then keys the result by label, so two ids sharing a label collide and
+# one silently overwrites the other, picked by glob order. When a query is re-authored on
+# Dune it gets a NEW id, and the old id has to be retired to a distinct *_legacy label
+# rather than left pointing at the same name.
+#
+# Missing an id here is not a loud failure — table_name_from_path() falls back to
+# "query_<id>", so the file loads under a name nothing downstream asks for while the real
+# name keeps resolving to the older extract. That has now bitten three times: reserve_config
+# (7798416 -> 7804264, E36) and again on 2026-09-03 with supply_withdraw and the oracle.
 TABLE_LABELS = {
-    "7702138": "supply_withdraw",
     "7798273": "borrow_repay",
     "7711042": "reserve_state_rates",
     # 7804264, not the pre-E20 7798416 — reserve_config was re-run for the full-year
@@ -22,8 +31,18 @@ TABLE_LABELS = {
     "7798349": "flashloan",
     "7798351": "user_account",
     "7798372": "collateral_toggle",
-    "7798226": "oracle_price_usd_eth_weth_6h",
+
+    # Re-authored on Dune 2026-09-03; the new id owns the canonical label and the superseded
+    # one is kept (not deleted) so its extract still resolves under an unambiguous name.
+    "8595322": "supply_withdraw",
+    "7702138": "supply_withdraw_legacy",
+    "8403530": "oracle_price_usd_eth_weth_6h",
+    "7798226": "oracle_price_usd_eth_weth_6h_legacy",
 }
+
+# A duplicate label is the silent-overwrite bug described above, so fail at import.
+_dupes = {v for v in TABLE_LABELS.values() if list(TABLE_LABELS.values()).count(v) > 1}
+assert not _dupes, f"TABLE_LABELS must be one-to-one; duplicated label(s): {sorted(_dupes)}"
 
 # Columns that, when present, are the table's address-style keys, sometimes unique for tx hashes, though not necessary for this project.
 ADDRESS_COLS = ("asset", "collateral_asset", "debt_asset")
@@ -31,7 +50,9 @@ ADDRESS_COLS = ("asset", "collateral_asset", "debt_asset")
 
 # --- helpers ---
 def table_name_from_path(path):
-    """Derive a short, table-specific name from a query_result_data_<id>_<ts>.csv file."""
+    """Derive a short, table-specific name from a versioned result CSV path.
+    Keys off the `_<query_id>_` in the stem, so it is unaffected by what follows it —
+    a date window (`_<start>_<end>`, `_asof_<end>`) or a legacy fetch stamp all work."""
     # reads the query id out of the _<id>_<stamp> tail, so the prefix can be anything
     stem = Path(path).stem
     match = re.search(r"_(\d+)_", stem)

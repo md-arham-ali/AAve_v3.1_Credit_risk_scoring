@@ -1,7 +1,10 @@
 """Transformation helpers for the Aave V3.1 Dune result tables.
 
-READS the versioned CSVs in query_result_data/ and never writes back there. Each
-fetch adds a new timestamped file, so the loaders resolve the latest per table.
+READS the versioned CSVs in query_result_data/ and never writes back there. A fetch adds
+a file named for the DATE WINDOW it contains (`_<start>_<end>` / `_asof_<end>`), or for
+the fetch time when the window is unknowable — a "stored" fetch is never told one. So the
+loaders here, latest_paths() and newest_matching(), are the single place that decides
+which file is current, and every stage must go through them rather than sorting a glob.
 """
 
 import re
@@ -19,34 +22,96 @@ from data_validation import TABLE_LABELS, table_name_from_path
 # Folder holding the raw, versioned extracts. Read-only from this stage.
 SOURCE_DIR = "query_result_data"
 
-# Matches the versioned suffix _<query_id>_<YYYYMMDDTHHMMSSZ> at the end of the stem —
-# works for both query_result_data_<id>_<ts>.csv and <table_name>_<id>_<ts>.csv.
-_NAME_RE = re.compile(r"_(\d+)_(\d{8}T\d{6}Z)$")
+# Three versioned-suffix forms, all ending the stem, all carrying the query id:
+#   _<id>_<start>_<end>     window-named  — what dune_fetch writes for an execute run
+#   _<id>_asof_<end>        window-named  — as-of snapshot, upper bound only (reserve_config)
+#   _<id>_<YYYYMMDDTHHMMSSZ>  fetch-stamped — legacy, and still what a "stored" fetch writes
+#                                             because that path is never told a window
+# Order matters when matching: the range form must be tried before the stamp form, since
+# a bare `_(\d+)_` prefix could otherwise claim part of a date.
+_RANGE_RE = re.compile(r"_(\d+)_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})$")
+_ASOF_RE = re.compile(r"_(\d+)_asof_(\d{4}-\d{2}-\d{2})$")
+_STAMP_RE = re.compile(r"_(\d+)_(\d{8}T\d{6}Z)$")
+
+# Kept as an alias: other code (and older notes) refer to transform._NAME_RE.
+_NAME_RE = _STAMP_RE
+
+# Window-named files outrank fetch-stamped ones. A stamp says only when a pull happened;
+# a window says what the file actually contains, which is the thing downstream needs.
+_TIER_WINDOW, _TIER_STAMP = 1, 0
 
 
 def _parse_name(path):
-    """Return (query_id, timestamp) from a versioned CSV path, or (None, None)."""
-    match = _NAME_RE.search(Path(path).stem)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
+    """Return (query_id, sort_key) for a versioned CSV path, or (None, None).
+
+    sort_key is (tier, end, start) and is meant for ordering, not display:
+      tier   window-named beats fetch-stamped (see _TIER_WINDOW)
+      end    latest end date wins — the file covering the most recent data
+      start  only a tiebreak; latest_paths() prefers the EARLIEST start on a tie, so
+             that between two files ending on the same day the wider one is chosen.
+    For a stamped file the stamp stands in for `end`, which keeps stamped files ordered
+    among themselves exactly as before."""
+    stem = Path(path).stem
+
+    match = _RANGE_RE.search(stem)
+    if match:
+        return match.group(1), (_TIER_WINDOW, match.group(3), match.group(2))
+
+    match = _ASOF_RE.search(stem)
+    if match:
+        # No lower bound at all, so it is the widest possible window for that end date.
+        return match.group(1), (_TIER_WINDOW, match.group(2), "")
+
+    match = _STAMP_RE.search(stem)
+    if match:
+        return match.group(1), (_TIER_STAMP, match.group(2), "")
+
+    return None, None
 
 
 def latest_paths(source_dir=SOURCE_DIR):
-    """Map each table label -> its newest versioned CSV path.
-    data_dir -> filenames parsed for query id + fetch timestamp.
-    Returns: {label: Path}. The timestamp suffix sorts lexicographically, so max = newest."""
-    newest = {}  # query_id -> (timestamp, path)
+    """Map each table label -> the winning versioned CSV path.
+    data_dir -> filenames parsed for query id + window (or legacy fetch stamp).
+    Returns: {label: Path}.
+
+    "Winning" is (tier, end) descending, then start ASCENDING — so a file ending later
+    wins, and among files ending on the same date the one starting earlier (covering
+    more) wins. That second step is why this cannot be a plain max() on the sort key."""
+    candidates = {}  # query_id -> [(sort_key, path), ...]
     for path in Path(source_dir).glob("*.csv"):
-        qid, stamp = _parse_name(path)
+        qid, key = _parse_name(path)
         if qid is None:
             continue
-        if qid not in newest or stamp > newest[qid][0]:
-            newest[qid] = (stamp, path)
+        candidates.setdefault(qid, []).append((key, path))
+
+    newest = {}
+    for qid, entries in candidates.items():
+        top = max(key[:2] for key, _ in entries)          # (tier, end)
+        tied = [(key, path) for key, path in entries if key[:2] == top]
+        newest[qid] = min(tied, key=lambda item: item[0][2])[1]   # earliest start
     return {
         TABLE_LABELS.get(qid, f"query_{qid}"): path
-        for qid, (_, path) in newest.items()
+        for qid, path in newest.items()
     }
+
+
+def newest_matching(pattern, source_dir=SOURCE_DIR):
+    """Newest versioned CSV whose filename matches a glob, e.g. 'reserve_config_*.csv'.
+    Returns: Path, or None when nothing matches.
+
+    Use this rather than sorted(glob(...))[-1]. A plain lexicographic sort orders
+    '..._2025-04-01_2026-03-31.csv' BEFORE '..._20260822T191557Z.csv' (they differ at the
+    4th character, '5' < '6'), so the old fetch-stamped file would silently keep winning
+    in a folder holding both naming styles."""
+    matches = list(Path(source_dir).glob(pattern))
+    if not matches:
+        return None
+    scored = [(key, p) for key, p in ((_parse_name(p)[1], p) for p in matches) if key]
+    if not scored:
+        return sorted(matches)[-1]        # unversioned names: nothing better than a sort
+    top = max(key[:2] for key, _ in scored)
+    tied = [(key, p) for key, p in scored if key[:2] == top]
+    return min(tied, key=lambda item: item[0][2])[1]
 
 
 def list_tables(source_dir=SOURCE_DIR):

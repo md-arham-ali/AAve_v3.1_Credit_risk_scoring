@@ -1,13 +1,9 @@
 """Advanced, finance-aware Great Expectations checks for the Aave V3.1 result tables.
 
-Domain expectations per value kind (amounts, rates, indexes, bps configs, oracle
-prices, health factors, counts), plus three standalone single-column diagnostics,
-the univariate pre-EDA profile (statistical_validation), and the Tier 0-4
-transformed-frame validators. Runs under .venv-ge (GE 0.18.x, pandas 2.x).
-
-Decimals rule: magnitude/range/shape checks stay in GE (bounds sit far from the data,
-so float rounding cannot flip them); every EXACT cross-column identity on big integers
-is computed in pure Python int via _to_int and tagged custom_*.
+Domain expectations per value kind, single-column diagnostics, the pre-EDA profile
+(statistical_validation) and the Tier 0-4 transformed-frame validators. Runs under
+.venv-ge (GE 0.18.x, pandas 2.x). Decimals rule: range/shape checks stay in GE, but
+every exact big-integer identity is computed in Python int via _to_int, tagged custom_*.
 """
 
 # TODO: scale this out once the remaining feature tables land.
@@ -853,11 +849,10 @@ def statistical_validation(df, table_name=None, columns=None,
 
 
 # --- transformed-frame validation (the model-ready frames in transformed_data/) ---
-# Different grain from the raw tables and already scaled, so these use plain pandas/Python
-# int and return NUMERIC results (pass-rate %, counts, offending columns + time_buckets)
-# rather than GE objects. Implements context/data_val.md Tiers 0-4:
-#   DF_common_final — protocol-level 6h feature matrix, time_bucket is the PK
-#   DF_common_1     — asset-level reserve panel keyed on (time_bucket, asset)
+# Already scaled and at a different grain from the raw tables, so these return numeric
+# results (pass rates, counts, offending columns) rather than GE objects. Implements
+# context/data_val.md Tiers 0-4 over DF_common_final (protocol panel, PK time_bucket)
+# and DF_common_1 (asset-level reserve panel, PK (time_bucket, asset)).
 
 TRANSFORM_RESULT_COLS = [
     "tier", "check", "columns", "severity",

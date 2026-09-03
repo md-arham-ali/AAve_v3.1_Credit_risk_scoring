@@ -1,11 +1,9 @@
 """Advanced univariate statistics for volatile / heavy-tailed financial data.
 
-Tail risk, drawdown, concentration, robust shape, risk-adjusted return, dependence —
-beyond adv_validation.statistical_validation. Every function takes a 1-D series-like
-OR (df, column) and returns a float (NaN on too little data or a zero denominator).
-
-Conventions: return/P&L metrics treat the input as returns — pass as_returns=False on
-the level-based ones. Annualisation is opt-in via periods_per_year.
+Tail risk, drawdown, concentration, robust shape, risk-adjusted return and dependence,
+beyond adv_validation.statistical_validation. Every function takes a 1-D series-like or
+(df, column) and returns a float, NaN when there is too little data. Return/P&L metrics
+treat the input as returns; annualisation is opt-in via periods_per_year.
 """
 
 # NOTE: parsing is delegated to adv_validation, so uint256 / RAY strings and the

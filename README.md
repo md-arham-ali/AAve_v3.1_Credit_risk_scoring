@@ -57,6 +57,9 @@ DUNE_API_KEY=your_key_here
 - **Notebooks orchestrate; modules define.** Keep action only in `*.ipynb`; put
   constants, helpers, and definitions in the `.py` modules.
 - **`time_bucket` is the primary key**; column order reflects decreasing priority.
-- **Versioned exports**: each fetch writes `query_result_data/query_result_data_{query_id}_{fetch_time}.csv`.
+- **Versioned exports**: each fetch writes `query_result_data/<table>_<query_id>_<start>_<end>.csv`,
+  named for the date window it contains (`_asof_<end>` when only an upper bound applies;
+  a fetch-time stamp when the window is unknowable). Resolve them with
+  `transform.latest_paths()` / `newest_matching()`, never `sorted(glob(...))[-1]`.
 - **Decimals-safe**: raw uint256/int256 values are parsed as exact Python `int` (never
   float) wherever an exact identity matters — pandas/GE silently corrupt big ints.
