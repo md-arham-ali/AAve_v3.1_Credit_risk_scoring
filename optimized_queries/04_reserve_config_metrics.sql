@@ -6,23 +6,23 @@ WITH ev AS (
     SELECT asset, 'supply_cap' AS param, CAST(newSupplyCap AS uint256) AS value,
            evt_block_time, evt_block_number, evt_index
     FROM aave_v3_ethereum.poolconfigurator_evt_supplycapchanged
-    WHERE evt_block_date < DATE '2026-04-01'
+    WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'borrow_cap', CAST(newBorrowCap AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_borrowcapchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_borrowcapchanged WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'debt_ceiling', CAST(newDebtCeiling AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_debtceilingchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_debtceilingchanged WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'reserve_factor', CAST(newReserveFactor AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_reservefactorchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_reservefactorchanged WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'liquidation_threshold', CAST(liquidationThreshold AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'liquidation_bonus', CAST(liquidationBonus AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '{{end_date}}'
     UNION ALL SELECT asset, 'ltv', CAST(ltv AS uint256), evt_block_time, evt_block_number, evt_index
-    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '2026-04-01'
+    FROM aave_v3_ethereum.poolconfigurator_evt_collateralconfigurationchanged WHERE evt_block_date < DATE '{{end_date}}'
 ),
 ev_b AS (
     SELECT asset, param,
-        date_add('hour', 2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
+        date_add('hour', {{bucket_hours}} * CAST(floor(hour(evt_block_time) / {{bucket_hours}}) AS bigint),
                  date_trunc('day', evt_block_time)) AS evt_bucket,
         max_by(value, ROW(evt_block_number, evt_index)) AS value
     FROM ev GROUP BY 1, 2, 3
@@ -34,7 +34,7 @@ iv AS (
 ),
 grid AS (
     SELECT g AS time_bucket
-    FROM UNNEST(sequence(TIMESTAMP '2025-04-01 00:00:00', TIMESTAMP '2026-03-31 22:00:00', INTERVAL '2' HOUR)) AS t(g)
+    FROM UNNEST(sequence(TIMESTAMP '{{start_date}} 00:00:00', TIMESTAMP '{{end_date}} 00:00:00', INTERVAL '1' HOUR * {{bucket_hours}})) AS t(g)
 ),
 state_long AS (
     SELECT g.time_bucket, iv.asset, iv.param, iv.value
@@ -54,11 +54,11 @@ state_wide AS (
 ),
 chg AS (
     SELECT
-        date_add('hour', 2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
+        date_add('hour', {{bucket_hours}} * CAST(floor(hour(evt_block_time) / {{bucket_hours}}) AS bigint),
                  date_trunc('day', evt_block_time)) AS time_bucket,
         asset, COUNT(*) AS config_event_count
     FROM ev
-    WHERE evt_block_time >= TIMESTAMP '2025-04-01 00:00:00' AND evt_block_time < TIMESTAMP '2026-04-01 00:00:00'
+    WHERE evt_block_time >= TIMESTAMP '{{start_date}} 00:00:00' AND evt_block_time < TIMESTAMP '{{end_date}} 00:00:00'
     GROUP BY 1, 2
 )
 SELECT

@@ -1,47 +1,3 @@
--- =====================================================================
--- Query 5 / Part 4B — Liquidation metrics
--- Grain / composite key : (time_bucket, asset)
--- Source                : aave_v3_ethereum.pool_evt_liquidationcall
--- Window                : 2025-11-01 00:00 (incl) .. 2026-02-01 00:00 (excl), UTC
--- Bucket                : fixed 6-hour slots (00 / 06 / 12 / 18 UTC)
---
--- WHY THIS IS PER-ASSET (was (time_bucket, collateral_asset, debt_asset))
---   A liquidation touches TWO assets: collateral seized + debt covered. The old
---   3-column grain could NOT join the rest of the panel (everything else is keyed
---   (time_bucket, asset)) and could NOT be decimal-scaled (one row carried two
---   amounts in two different tokens). This query re-keys to (time_bucket, asset) by
---   emitting each liquidation as TWO legs — a collateral leg (asset = collateralAsset)
---   and a debt leg (asset = debtAsset) — then aggregating per asset. Each amount is
---   now denominated in ITS OWN row asset's token units, so `scale_by_decimals`
---   (keyed on asset) is correct, and the table joins on (time_bucket, asset).
---
--- Credit-optimization notes
---   * Single source table; partition-pruned on evt_block_date. The UNION ALL is two
---     projections of the SAME pruned scan (collateral leg + debt leg), one GROUP BY.
---   * Wallet fields (user, liquidator) NEVER leave the query as raw output — consumed
---     only inside approx_distinct() HLL counters (deduped across the 2 legs of an
---     event, so each distinct actor is counted once per asset).
---   * Amounts COALESCE to 0 (not NULL): a row exists because the asset took part in a
---     liquidation; "0 seized as collateral" / "0 debt covered" is the true value for
---     the role the asset did NOT play. Counts are 0, never NULL, by construction.
---   * asset_symbol — on-chain token symbol from tokens.erc20 (blockchain = 'ethereum'),
---     one LEFT JOIN after aggregation on the small per-bucket result; assets absent
---     from tokens.erc20 get symbol = NULL. Readability/QA label — keep joining on the
---     `asset` address downstream.
---
--- Columns
---   liquidated_collateral_raw    Σ liquidatedCollateralAmount where asset = collateral
---                                (collateral-asset token units → see decimal_reference_part4)
---   liquidation_debt_covered_raw Σ debtToCover           where asset = debt
---                                (debt-asset token units)
---   as_collateral_tx_count       # liquidation legs where this asset was the collateral
---   as_debt_tx_count             # liquidation legs where this asset was the debt
---   liquidation_tx_count         total legs touching this asset (= collateral + debt)
---   receive_atoken_count         collateral legs where the liquidator took aTokens
---   unique_liquidated_users      approx-distinct borrowers liquidated (HLL)
---   unique_liquidators           approx-distinct liquidators (HLL)
---   latest_liquidation_block     end-of-period block marker
--- =====================================================================
 -- Query 5 / Part 4B — Liquidation metrics — grain (time_bucket, asset)
 -- Each liquidation is split into a collateral leg (asset=collateralAsset) and a debt
 -- leg (asset=debtAsset), then aggregated per asset, so it joins/scales like every
@@ -54,7 +10,7 @@ WITH legs AS (
         CAST(NULL AS uint256) AS debt_covered,
         receiveAToken, "user", liquidator, evt_block_number
     FROM aave_v3_ethereum.pool_evt_liquidationcall
-    WHERE evt_block_date >= DATE '2025-04-01' AND evt_block_date < DATE '2026-04-01'
+    WHERE evt_block_date >= DATE '{{start_date}}' AND evt_block_date < DATE '{{end_date}}'
     UNION ALL
     SELECT
         date_trunc('hour', evt_block_time) AS time_bucket,
@@ -63,11 +19,11 @@ WITH legs AS (
         debtToCover AS debt_covered,
         receiveAToken, "user", liquidator, evt_block_number
     FROM aave_v3_ethereum.pool_evt_liquidationcall
-    WHERE evt_block_date >= DATE '2025-04-01' AND evt_block_date < DATE '2026-04-01'
+    WHERE evt_block_date >= DATE '{{start_date}}' AND evt_block_date < DATE '{{end_date}}'
 ),
 buckets AS (
     SELECT
-        date_add('hour', 2 * CAST(floor(EXTRACT(hour FROM time_bucket) / 2) AS bigint), date_trunc('day', time_bucket)) AS time_bucket_2h,
+        date_add('hour', {{bucket_hours}} * CAST(floor(EXTRACT(hour FROM time_bucket) / {{bucket_hours}}) AS bigint), date_trunc('day', time_bucket)) AS time_bucket_2h,
         asset, role, collateral_seized, debt_covered, receiveAToken, "user", liquidator, evt_block_number
     FROM legs
 ),

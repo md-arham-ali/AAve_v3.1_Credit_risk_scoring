@@ -2,8 +2,11 @@
 
 fetch_query_table() reads the stored result — free, but fixed to the window the query was
 last run with. run_query_table() re-runs it for a window you choose: costs credits, and
-needs {{start_date}}/{{end_date}} already in the SQL on Dune. Keys resolve per account
-group. Long-form notes on all of this: explanations_notebooks.md.
+needs {{start_date}}/{{end_date}} — plus {{bucket_hours}} when you set the grain — already
+in the SQL on Dune. A parameter the query does not declare is NOT rejected: Dune ignores
+it, runs the width hardcoded in that SQL, and still bills, so an unparameterised query
+looks like it accepted the value. Keys resolve per account group. Long-form notes on all
+of this: explanations_notebooks.md.
 """
 
 import json
@@ -32,6 +35,14 @@ DEFAULT_MANIFEST_DIR = "query_result_data/_runs"
 # Set "small"/"medium"/"large" per call only when you actually want to pin one.
 DEFAULT_PERFORMANCE = None
 VALID_PERFORMANCE_TIERS = ("small", "medium", "large")
+
+# Bucket widths the panel may be built on — the divisors of 24, and nothing else.
+# The SQL bucket formula, floor(hour(t) / N) * N, restarts at every midnight, while query
+# 04's grid CTE strides continuously from start_date. Those two agree only when N divides
+# 24. At N=5 the formula's last bucket of each day is short and the grid drifts to 01:00,
+# 06:00, ... — reserve_config then keys on timestamps no other table produces and joins to
+# nothing, with no error raised anywhere. Rejecting the width here is the only guard.
+VALID_BUCKET_HOURS = (1, 2, 3, 4, 6, 8, 12, 24)
 
 # Export is billed per MB, so one careless 25 MB pull costs a fifth of a free month's
 # quota (the 402s on 2026-07-25). Raise deliberately, per call, once you know the size.
@@ -270,7 +281,13 @@ def _save_csv(df, query_id, save_dir, table_name, start_date=None, end_date=None
 
     Note this makes a re-fetch of the SAME window overwrite in place instead of piling up
     another timestamped copy. That is the intended behaviour; the run manifest still keeps
-    one dated record per execution."""
+    one dated record per execution.
+
+    The bucket width is deliberately NOT in the name. transform._parse_name anchors all
+    three of its patterns to the END of the stem, so any extra suffix makes the file
+    invisible to latest_paths() rather than merely misnamed. Consequence: re-running one
+    window at a different bucket_hours overwrites the previous CSV in place, and the run
+    manifest is the only record of which width produced a given file."""
     folder = Path(save_dir)
     folder.mkdir(parents=True, exist_ok=True)
     prefix = table_name or DEFAULT_SAVE_DIR
@@ -360,7 +377,13 @@ def wait_for_execution(execution_id, api_key=None, poll_seconds=5, timeout_secon
     """Block until an execution reaches a terminal state.
     poll_seconds/timeout_seconds -> repeated free status calls.
     Returns: final status payload. Raises on FAILED/CANCELLED/EXPIRED or timeout — note a
-    timeout does NOT cancel the execution, it keeps running and keeps billing."""
+    timeout does NOT cancel the execution, it keeps running and keeps billing.
+
+    timeout_seconds is a POLLING budget, nothing more. It cannot extend how long Dune is
+    willing to run a query: the engine has its own server-side cap set by the account's
+    plan, and when that fires the execution comes back QUERY_STATE_FAILED with Dune's own
+    "timed out after N minutes" message. Raising timeout_seconds has no effect on that —
+    the two limits are unrelated, and only the smaller one is ever observed."""
     deadline = time.monotonic() + timeout_seconds
     last_state = None
     while True:
@@ -373,9 +396,25 @@ def wait_for_execution(execution_id, api_key=None, poll_seconds=5, timeout_secon
         if state in _DONE_STATES:
             if state != "QUERY_STATE_COMPLETED":
                 error = status.get("error") or {}
+                message = error.get("message", "no error message")
+                # Keyed off what Dune actually said, like _raise_for_status. Worth spelling
+                # out because the two timeouts read identically in a traceback and only one
+                # of them is ours: a server-side kill arrives as FAILED (this branch), while
+                # our own budget expiring raises TimeoutError further down.
+                hint = ""
+                if "timed out" in message.lower():
+                    hint = (
+                        f"  (Dune's own execution cap, set by the account plan — NOT this "
+                        f"client. timeout_seconds={timeout_seconds} is only how long we are "
+                        "willing to poll and was never reached, so raising it changes "
+                        "nothing. What does help: a bigger engine (performance='large'), a "
+                        "narrower window, or confirming the query still declares "
+                        "{{start_date}}/{{end_date}} on Dune — a parameter dropped while "
+                        "editing is ignored rather than rejected, so the query silently runs "
+                        "its full hardcoded range and blows the cap)"
+                    )
                 raise RuntimeError(
-                    f"Execution {execution_id} ended as {state}: "
-                    f"{error.get('message', 'no error message')}"
+                    f"Execution {execution_id} ended as {state}: {message}{hint}"
                 )
             return status
 
@@ -434,15 +473,44 @@ def fetch_execution_table(execution_id, query_id=None, api_key=None,
     return df, csv_path
 
 
+def _validate_bucket_hours(bucket_hours):
+    """Coerce a bucket width to int and reject any width 24 is not a multiple of.
+    bucket_hours -> int. Accepts "6" as well as 6, since a width can arrive from an env
+    var or a widget; Dune substitutes the parameter textually either way."""
+    try:
+        width = int(bucket_hours)
+        # int() floors, so 2.5 would arrive as a silent 2 — the exact class of quiet
+        # width mismatch this function exists to prevent. Reject it instead.
+        if width != float(bucket_hours):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"bucket_hours must be a whole number of hours, got {bucket_hours!r}"
+        ) from None
+    if width not in VALID_BUCKET_HOURS:
+        raise ValueError(
+            f"bucket_hours={width} is not one of {VALID_BUCKET_HOURS}. 24 must be a "
+            "multiple of the width, or query 04's grid drifts out of step with the bucket "
+            "formula and reserve_config silently stops joining to the other tables."
+        )
+    return width
+
+
 def run_query_table(query_id, start_date=None, end_date=None, table_name=None,
                     api_key=None, save_dir=DEFAULT_SAVE_DIR, page_limit=100000, save=True,
                     performance=DEFAULT_PERFORMANCE, extra_params=None,
                     start_param="start_date", end_param="end_date",
                     max_result_mb=DEFAULT_MAX_RESULT_MB, poll_seconds=5,
-                    timeout_seconds=1800, dry_run=False, verbose=True):
+                    timeout_seconds=1800, dry_run=False, verbose=True,
+                    bucket_hours=None, bucket_param="bucket_hours"):
     """Re-run a parameterised Dune query for one date window and save the result.
     query_id + start_date/end_date -> execute -> poll -> size check -> paged download.
-    Returns: (DataFrame, csv_path, meta); on dry_run (None, None, meta), nothing billed."""
+    Returns: (DataFrame, csv_path, meta); on dry_run (None, None, meta), nothing billed.
+
+    bucket_hours sets the panel grain and is sent only when not None — pass None for any
+    query that does not yet declare {{bucket_hours}} on Dune, since sending it there is
+    accepted, ignored, and billed at the SQL's hardcoded width. Validated against
+    VALID_BUCKET_HOURS before anything is executed, so a bad width costs no credits."""
 
     # Dates pass through verbatim as 'YYYY-MM-DD' — the SQL supplies the DATE '...'
     # wrapper — and end_date is EXCLUSIVE, so April 2025 is 2025-04-01 -> 2025-05-01.
@@ -451,6 +519,12 @@ def run_query_table(query_id, start_date=None, end_date=None, table_name=None,
         params[start_param] = start_date
     if end_date is not None:
         params[end_param] = end_date
+
+    # Validated before the execute call, not after: an invalid width must cost nothing.
+    # Sent only when asked for — see the docstring on why a stray value is worse than a
+    # missing one here.
+    if bucket_hours is not None:
+        params[bucket_param] = _validate_bucket_hours(bucket_hours)
 
     meta = {
         "query_id": query_id,
@@ -608,11 +682,17 @@ def run_group(group, query_groups, api_keys, tables=None, key_source=None,
               mode="stored", start_date=None, end_date=None, param_overrides=None,
               performance=DEFAULT_PERFORMANCE, max_result_mb=DEFAULT_MAX_RESULT_MB,
               poll_seconds=5, timeout_seconds=1800, dry_run=False,
-              save_dir=DEFAULT_SAVE_DIR, page_limit=100000, show=None, verbose=True):
+              save_dir=DEFAULT_SAVE_DIR, page_limit=100000, show=None, verbose=True,
+              bucket_hours=None):
     """Fetch or execute every query owned by one account group, using that group's key.
     group looks up query_groups[group] and api_keys[group] together, so a key cannot be
     paired with another account's queries. mode: "stored" (fetch) or "execute" (re-run).
-    Returns: {"tables": {name: df}, "metas": [...], "failures": {name: why}}."""
+    Returns: {"tables": {name: df}, "metas": [...], "failures": {name: why}}.
+
+    bucket_hours goes to every table in the group; opt one out with
+    param_overrides={"<table>": {"bucket_hours": None}} until its SQL on Dune declares the
+    parameter. Mixed widths across tables produce a panel whose (time_bucket, asset) keys
+    do not line up, which no downstream stage can detect, so the opt-outs are printed."""
 
     if mode not in {"stored", "execute"}:
         raise ValueError(f"mode must be 'stored' or 'execute', got {mode!r}")
@@ -641,6 +721,17 @@ def run_group(group, query_groups, api_keys, tables=None, key_source=None,
         print(f"group {group} ({source})  mode={mode}  {len(selected)} quer(y/ies)")
         if mode == "execute":
             print(f"  window {start_date} -> {end_date} (end exclusive)  dry_run={dry_run}")
+            if bucket_hours is not None:
+                # Named explicitly because a table running at the wrong width still
+                # succeeds, still bills, and looks identical in the output.
+                opted_out = [t for t in selected
+                             if param_overrides.get(t, {}).get("bucket_hours", "") is None]
+                sent = [t for t in selected if t not in opted_out]
+                print(f"  bucket_hours={bucket_hours} -> "
+                      f"{', '.join(sent) if sent else '(none)'}")
+                if opted_out:
+                    print(f"    NOT sent to {', '.join(opted_out)} — each runs at the "
+                          "width hardcoded in its own SQL")
         print()
 
     out = {"tables": {}, "metas": [], "failures": {}}
@@ -654,6 +745,7 @@ def run_group(group, query_groups, api_keys, tables=None, key_source=None,
                 kwargs = dict(
                     start_date=start_date,
                     end_date=end_date,
+                    bucket_hours=bucket_hours,
                     performance=performance,
                     max_result_mb=max_result_mb,
                     timeout_seconds=timeout_seconds,
@@ -734,10 +826,13 @@ def make_runner(query_groups, api_keys, key_source=None, show=None, **defaults):
 
 if __name__ == "__main__":
     # Stored result:  python dune_fetch.py <query_id>
-    # Fresh window :  python dune_fetch.py <query_id> <start_date> <end_date>
+    # Fresh window :  python dune_fetch.py <query_id> <start_date> <end_date> [bucket_hours]
     qid = int(sys.argv[1])
     if len(sys.argv) >= 4:
-        frame, path, run_meta = run_query_table(qid, sys.argv[2], sys.argv[3])
+        frame, path, run_meta = run_query_table(
+            qid, sys.argv[2], sys.argv[3],
+            bucket_hours=sys.argv[4] if len(sys.argv) >= 5 else None,
+        )
         print(f"Ran {qid} [{sys.argv[2]} -> {sys.argv[3]}]: "
               f"{len(frame)} rows, {run_meta['execution_cost_credits']} credits -> {path}")
     else:

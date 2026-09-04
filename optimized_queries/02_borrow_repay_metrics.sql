@@ -1,26 +1,3 @@
--- =====================================================================
--- Query 2 / Part 2 — Borrow + Repay metrics
--- Grain / composite key : (time_bucket, asset)
--- Sources               : aave_v3_ethereum.pool_evt_borrow
---                         aave_v3_ethereum.pool_evt_repay
--- Window                : 2025-11-01 00:00 (incl) .. 2026-02-01 00:00 (excl), UTC
--- Bucket                : fixed 6-hour slots (00 / 06 / 12 / 18 UTC)
---
--- Credit-optimization notes
---   * Borrow + Repay folded into ONE query via UNION ALL -> single GROUP BY.
---   * Partition pruning on evt_block_date.
---   * last_borrow_rate = end-of-period state via max_by(value, key); the key is
---     NULL for repay rows so they are ignored, and among borrow rows it returns
---     borrowRate at the highest (block_number, evt_index) in the bucket.
---   * interestRateMode lives only on pool_evt_borrow (1 = stable, 2 = variable).
---   * Wallet fields used only inside approx_distinct().
---   * Raw values only — avg_borrow_rate etc. are DERIVED downstream, not here.
---   * asset_symbol — on-chain token symbol from tokens.erc20 (blockchain =
---     'ethereum'). Resolved via a LEFT JOIN applied AFTER aggregation, on the small
---     per-bucket result set, so the heavy event scan is unchanged; assets missing
---     from tokens.erc20 get symbol = NULL. The symbol is a readability/QA label —
---     keep joining on `asset` (address) downstream, not on the symbol.
--- =====================================================================
 WITH events AS (
     SELECT
         reserve                       AS asset,
@@ -33,11 +10,9 @@ WITH events AS (
         borrowRate                    AS borrow_rate,
         'borrow'                      AS kind
     FROM aave_v3_ethereum.pool_evt_borrow
-    WHERE evt_block_date >= DATE '2025-04-01'
-      AND evt_block_date <  DATE '2026-03-31'
-
+    WHERE evt_block_date >= DATE '{{start_date}}'
+      AND evt_block_date <  DATE '{{end_date}}'
     UNION ALL
-
     SELECT
         reserve                       AS asset,
         evt_block_time,
@@ -49,13 +24,13 @@ WITH events AS (
         CAST(NULL AS uint256)         AS borrow_rate,
         'repay'                       AS kind
     FROM aave_v3_ethereum.pool_evt_repay
-    WHERE evt_block_date >= DATE '2025-04-01'
-      AND evt_block_date <  DATE '2026-03-31'
+    WHERE evt_block_date >= DATE '{{start_date}}'
+      AND evt_block_date <  DATE '{{end_date}}'
 ),
 agg AS (
     SELECT
         date_add('hour',
-                 2 * CAST(floor(hour(evt_block_time) / 2) AS bigint),
+                 {{bucket_hours}} * CAST(floor(hour(evt_block_time) / {{bucket_hours}}) AS bigint),
                  date_trunc('day', evt_block_time))                            AS time_bucket,
         asset,
         SUM(CASE WHEN kind = 'borrow' THEN amount END)                         AS borrow_amount_raw,
