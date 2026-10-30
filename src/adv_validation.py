@@ -1317,17 +1317,27 @@ def tf_tier3_consistency(df):
 
 
 # --- Tier 4: temporal integrity (time_bucket as the protocol-level primary key) ---
-def _full_6h_grid(start, end):
-    """Every 6h boundary from start to end inclusive (as pandas Timestamps)."""
-    # TODO: hardcoded to the 6h grain; parameterize when the 2h panel gets its own tier 4
-    from datetime import timedelta
-    step, t, grid = timedelta(hours=1), start, []
+def _frame_step(valid):
+    """The frame's own bucket width: the most common gap between consecutive distinct stamps.
+    The grid is READ from the data, never assumed, so one check serves 2h, 6h and 24h frames;
+    a wrong-width or gappy frame still fails because the mode ignores the odd gap."""
+    stamps = sorted(set(valid))
+    if len(stamps) < 2:
+        return None
+    gaps = pd.Series([b - a for a, b in zip(stamps, stamps[1:])])
+    return gaps.mode().iloc[0]
+
+
+def _full_grid(start, end, step):
+    """Every `step` boundary from start to end inclusive (as pandas Timestamps)."""
+    grid, t = [], start
     while t <= end:
         grid.append(t); t += step
     return grid
 
 
-def tf_tier4_temporal(df):
+def tf_tier4_temporal(df, bucket_hours=None):
+    """Tier 4. `bucket_hours` pins the expected width; None reads it from the frame."""
     rows = []
     if "time_bucket" not in df.columns:
         return pd.DataFrame(rows, columns=TRANSFORM_RESULT_COLS)
@@ -1340,18 +1350,26 @@ def tf_tier4_temporal(df):
                           len(df), sum(dup), anomaly_buckets=dup_sample,
                           detail=f"distinct={df['time_bucket'].nunique()} of {len(df)} rows"))
 
-    grid_bad = [bool(pd.isna(p)) or (p.minute or p.second)
-                for p in parsed]                                # 6h grid alignment
-    _, g_sample = _key_buckets(df, grid_bad)
-    rows.append(_t_record("T4", "time_bucket lands on a 6h boundary (00/06/12/18 UTC)",
-                          "time_bucket", len(df), sum(grid_bad), anomaly_buckets=g_sample))
-
     valid = sorted(p for p in parsed if not pd.isna(p))
-    if valid:
-        grid = _full_6h_grid(valid[0], valid[-1])               # gaps / coverage
+    step = pd.Timedelta(hours=bucket_hours) if bucket_hours else _frame_step(valid)
+    step_h = step / pd.Timedelta(hours=1) if step is not None else None
+    # bucket alignment: whole minutes/seconds, and the hour a multiple of the width (end stamps
+    # 02:00 … 24:00 → 00:00 all qualify for a 2h grid)
+    grid_bad = [bool(pd.isna(p)) or bool(p.minute or p.second)
+                or (step_h is not None and 1 <= step_h <= 24 and float(step_h).is_integer()
+                    and p.hour % int(step_h) != 0)
+                for p in parsed]
+    _, g_sample = _key_buckets(df, grid_bad)
+    width = f"{step_h:g}h" if step_h is not None else "?"
+    rows.append(_t_record("T4", f"time_bucket lands on a {width} boundary",
+                          "time_bucket", len(df), sum(grid_bad), anomaly_buckets=g_sample,
+                          detail=f"bucket width {width} ({'given' if bucket_hours else 'read from the frame'})"))
+
+    if valid and step is not None:
+        grid = _full_grid(valid[0], valid[-1], step)            # gaps / coverage
         present = set(valid)
         missing = [g for g in grid if g not in present]
-        rows.append(_t_record("T4", "no gaps: full 6h coverage over min..max range",
+        rows.append(_t_record("T4", f"no gaps: full {width} coverage over min..max range",
                               "time_bucket", len(grid), len(missing),
                               anomaly_buckets=[g.strftime("%Y-%m-%d %H:%M UTC") for g in missing[:10]],
                               detail=f"expected={len(grid)} present={len(present)} "
@@ -1401,7 +1419,7 @@ def validate_reserve_panel(df, table_name="DF_common_1",
         rows.append(_t_record("T0", "time_bucket is a tz-explicit UTC timestamp",
                               "time_bucket", len(df), int((~ok).sum())))
         grid = s.str.contains(GRID_6H_REGEX, regex=True, na=False)
-        rows.append(_t_record("T4", "time_bucket lands on a 6h boundary",
+        rows.append(_t_record("T4", "time_bucket on a whole-hour boundary",
                               "time_bucket", len(df), int((~grid).sum())))
     for c in ("last_borrow_rate", "liquidity_rate", "variable_borrow_rate"):
         if c in df.columns:

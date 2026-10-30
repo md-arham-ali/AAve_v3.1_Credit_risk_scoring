@@ -129,6 +129,14 @@ STRESS_QUANTILE = 0.75
 # overwrite these.
 MODEL_RESULTS_DIR = "model_results"
 
+# Where the model-stage DATA lands: model_data/batch_<start>_<end>/ with fixed file
+# names (DF_model_dataset_24h.csv, DF_model_{train,val,test}.csv, model_split_meta.json),
+# resolved per run by transform.BatchRun.folder(cfg.MODEL_DATA_DIR) — writers create=True,
+# readers create=False. One level below the batch folder with no dates in the names, so
+# neither transform's OUTPUT_PATTERN ("*/*.csv") nor any §1 resolver can see these files.
+# src/publish_bundle.py reads exactly this folder. A second domain MUST change this too.
+MODEL_DATA_DIR = "model_data"
+
 # Priority score pushed into column_priority.json for this domain's features.
 FEATURE_PRIORITY = 2.0
 
@@ -168,13 +176,13 @@ FEATURE_COLS = (
     "borrow_capacity_utilization", "remaining_borrow_capacity", "risk_buffer",
     "ltv_utilization", "distance_to_liquidation", "debt_expansion_ratio",
     "capital_efficiency", "overcollateral_margin", "has_sampled_borrow_position",
-    # credit flows (daily-aggregated DF_common_final_1)
+    # credit flows (daily-aggregated DF_common_final_2)
     "borrow_tx_count", "unique_borrowers",
     "borrow_amount_value_usd", "borrow_amount_value_eth", "repay_amount_value_usd",
     "borrow_repay_ratio", "repayment_discipline", "net_borrow_demand_usd",
     "borrower_participation_rate", "leverage_indicator",
     "collateral_enabled_count", "collateral_disabled_count", "collateral_usage_rate",
-    # market context (daily-aggregated DF_common_final_1)
+    # market context (daily-aggregated DF_common_final_2)
     "net_liquidity_flow_usd", "supply_withdrawal_ratio", "protocol_turnover_usd",
     "flashloan_usage_intensity", "flashloan_amount_value_usd", "user_activity",
 )

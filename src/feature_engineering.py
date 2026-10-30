@@ -1,8 +1,10 @@
-"""Statistics-driven splits of the protocol-level feature panel (DF_common_final_1).
+"""Statistics-driven splits of the protocol-level feature panel (DF_common_final_2).
 
 Each split is justified by statistics from adv_validation / EDA rather than by eye,
 and every row split is equal-count balanced — no piece dominates by sheer count.
 """
+
+import re
 
 import numpy as np
 import pandas as pd
@@ -13,11 +15,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import EDA
 import adv_validation as adv
+import transform as tf
 
 TIME_COL = "time_bucket"
 STAT_COLS = adv.STAT_COLS
 
-# Default signal columns (present in DF_common_final_1).
+# Default signal columns (present in DF_common_final_2).
 FLOW_COL = "net_liquidity_flow_usd"      # umbrella 5 — directional throughput
 ACTIVITY_COL = "user_activity"           # umbrella 6 — per-bucket active-user count
 VOLUME_COL = "protocol_turnover_usd"     # umbrella 7 — $ throughput (numerator)
@@ -302,3 +305,225 @@ def column_group_profile(df, groups, metrics=("excess_kurtosis", "hill_tail_inde
             row[f"mean_{m}"] = float(sub[m].mean(skipna=True))
         rows.append((name, row))
     return pd.DataFrame({name: r for name, r in rows}).T
+
+
+# --- model_features: analysis units from one pinned batch, model-feature columns only ---
+QUALITY_COLS = ["column", "null_pct", "zero_pct", "negative_pct", "cv", "p95", "p99",
+                "skewness", "excess_kurtosis", "outlier_iqr_pct", "outlier_mad_pct"]
+
+
+def grid_length(frame, freq="2h", time_col=TIME_COL):
+    """Buckets on a gap-free `freq` grid from the frame's first to last time_bucket."""
+    t = pd.to_datetime(frame[time_col].astype(str).str.replace(" UTC", "", regex=False))
+    return int((t.max() - t.min()) / pd.Timedelta(freq)) + 1
+
+
+def feature_units(frames, feature_cols, span, main, freq="2h",
+                  derived=("has_liquidation",), time_col=TIME_COL):
+    """Group one batch's frames into analysis units, keeping only model-feature columns.
+    frames: {label: DataFrame}; span: run.span; main: the label that must fill the whole
+    `freq` grid. A frame holding exactly main's buckets joins the main unit; any other
+    row count becomes a unit of its own and is never merged.
+    Returns: (units {name: DataFrame}, summary DataFrame)."""
+    base = frames[main]
+    n_grid = grid_length(base, freq, time_col)
+    assert len(base) == n_grid and not base[time_col].duplicated().any(), (
+        f"{main}: {len(base)} rows, but the full {freq} grid of its span is {n_grid}")
+    have = set().union(*(set(f.columns) for f in frames.values()))
+    missing = [c for c in feature_cols if c not in have and c not in derived]
+    assert not missing, f"model features absent from every frame: {missing}"
+    for label, frame in frames.items():
+        got = tf.month_span(frame)
+        assert got == tuple(span), f"{label} covers {got}, but the run is pinned to {span}"
+
+    def features_in(frame, taken=()):
+        return [c for c in feature_cols if c in frame.columns and c not in taken]
+
+    grid = set(base[time_col])
+    joined = [l for l, f in frames.items()
+              if l != main and len(f) == n_grid and set(f[time_col]) == grid]
+    unit = base[[time_col, *features_in(base)]]
+    for label in joined:
+        extra = features_in(frames[label], taken=unit.columns)
+        unit = unit.merge(frames[label][[time_col, *extra]], on=time_col, how="left")
+    units = {main: unit}
+    rows = [{"unit": main, "tables": ", ".join([main, *joined]), "rows": len(unit),
+             "features": unit.shape[1] - 1, "analysis": f"main {freq} grid"}]
+    for label, frame in frames.items():
+        if label == main or label in joined:
+            continue
+        units[label] = frame[[time_col, *features_in(frame)]]
+        rows.append({"unit": label, "tables": label, "rows": len(frame),
+                     "features": units[label].shape[1] - 1, "analysis": "separate"})
+    return units, pd.DataFrame(rows)
+
+
+def cluster_count(frame, per_cluster=5, minimum=2, time_col=TIME_COL):
+    """Co-movement cluster count scaled to the unit's width: ~per_cluster columns each."""
+    n_cols = len([c for c in frame.columns if c != time_col])
+    return max(minimum, -(-n_cols // per_cluster))
+
+
+def quality_table(frame, weights, time_col=TIME_COL):
+    """Univariate quality profile of one unit's feature columns, highest model weight first."""
+    cols = [c for c in frame.columns if c != time_col]
+    q = adv.statistical_validation(frame, table_name="model_features", columns=cols,
+                                   save=False)[QUALITY_COLS].copy()
+    q.insert(1, "weight", q["column"].map(dict(weights)))
+    return q.sort_values("weight", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def log1p_candidates(quality, threshold):
+    """Never-negative columns whose skew exceeds `threshold`. Indicative only:
+    model_split refits the log1p choice on daily train rows."""
+    keep = (quality["skewness"] > threshold) & (quality["negative_pct"] == 0)
+    return quality.loc[keep, ["column", "weight", "skewness", "excess_kurtosis", "p99"]
+                       ].reset_index(drop=True)
+
+
+# --- model_features: pairwise correlation inside ONE model frame ---
+# Rolled columns carry their window in the name ('x_rolled_24h', 'x__rolled_24h', 'x_trail_7d'),
+# so one feature at two windows can be told apart from two different features.
+WINDOW_SUFFIX_RE = re.compile(r"_+(?:rolled|trail)_\d+[a-z]+$")
+
+
+def base_name(column):
+    """Feature name without its window suffix: 'borrow_tx_count__rolled_24h' -> 'borrow_tx_count'."""
+    return WINDOW_SUFFIX_RE.sub("", column)
+
+
+def correlation_columns(frame, columns=None, exclude=(), by=None):
+    """Columns a correlation check runs on: `columns` (default every numeric column),
+    minus `exclude` and the `by` key."""
+    skip = {*exclude, by}
+    cols = list(columns) if columns is not None else numeric_columns(frame)
+    return [c for c in cols if c not in skip]
+
+
+# --- model_features: univariate profile of a whole model frame (read before correlation) ---
+# Same numbers as §2's quality_table, but over EVERY column of the frame (carried operands
+# and rolled windows included), so a null/zero/constant column is known before any r is read.
+PROFILE_COLS = ["column", "n", "n_null", "null_pct", "n_zero", "zero_pct", "negative_pct",
+                "n_unique", "is_constant", "is_quasi_constant", "mean", "std", "cv",
+                "min", "median", "p95", "p99", "max", "skewness", "excess_kurtosis",
+                "outlier_iqr_pct", "flags"]
+
+
+def frame_profile(frame, name=None, columns=None, exclude=(), by=None, stats=PROFILE_COLS):
+    """Univariate profile of one model frame's columns, via adv.statistical_validation(save=False).
+    by: key column of a LONG frame (asset_symbol) — profiled INSIDE each group, as correlation is,
+    so one asset's levels never read as the frame's distribution.
+    Returns: DataFrame of `stats`, one row per column (per group value when `by` is given)."""
+    cols = correlation_columns(frame, columns, exclude, by)
+
+    def profile(part, label):
+        prof = adv.statistical_validation(part, table_name=label, columns=cols, save=False)
+        return prof[[c for c in stats if c in prof.columns]]
+
+    label = name or "model_frame"
+    if by is None:
+        return profile(frame, label).reset_index(drop=True)
+    blocks = []
+    for value, part in frame.groupby(by, sort=True):
+        block = profile(part, f"{label}:{value}")
+        block.insert(0, by, value)
+        blocks.append(block)
+    return pd.concat(blocks, ignore_index=True)
+
+
+def frame_profiles(frames, exclude=None, by=None, **kwargs):
+    """frame_profile per frame; `exclude` and `by` are per-label dicts, as the correlation calls take.
+    Returns: {label: profile DataFrame}."""
+    exclude, by = exclude or {}, by or {}
+    return {name: frame_profile(frame, name=name, exclude=exclude.get(name, ()),
+                                by=by.get(name), **kwargs)
+            for name, frame in frames.items()}
+
+
+# flags that make a column's r unreadable (no variance, mostly missing, mostly zeros).
+# heavy_tailed / iqr_outliers are left out on purpose: nearly every USD column carries them,
+# and §2's log1p_candidates already handles shape.
+CONCERN_FLAGS = ("constant", "quasi_constant", "high_null", "zero_inflated",
+                 "no_debt_sentinel")
+
+
+def profile_concerns(profile, flags=CONCERN_FLAGS, null_pct=None, zero_pct=None):
+    """The rows of a frame_profile() worth acting on before reading correlation: columns with
+    no variance, mostly missing or mostly zeros, or past the null/zero limits
+    (defaults: adv_validation's own warn levels). Shape flags are not concerns here.
+    Returns: the same columns, concerning rows only."""
+    null_lim = adv.NULL_FRAC_WARN * 100 if null_pct is None else null_pct
+    zero_lim = adv.ZERO_FRAC_WARN * 100 if zero_pct is None else zero_pct
+    flagged = profile["flags"].fillna("").str.split(";").apply(
+        lambda fs: any(f in flags for f in fs))
+    hit = (flagged
+           | profile["is_constant"].fillna(False).astype(bool)
+           | profile["is_quasi_constant"].fillna(False).astype(bool)
+           | (profile["null_pct"].fillna(0) > null_lim)
+           | (profile["zero_pct"].fillna(0) > zero_lim))
+    return profile[hit].reset_index(drop=True)
+
+
+def _correlation(data, method, group_key, min_periods):
+    """r matrix of `data`'s columns. With `group_key` (one value per row) it is the MEDIAN of
+    the per-group matrices, so a level gap between groups never reads as correlation."""
+    if group_key is None:
+        return data.corr(method=method, min_periods=min_periods)
+    per_group = {key: part.corr(method=method, min_periods=min_periods)
+                 for key, part in data.groupby(group_key, sort=False)}
+    return (pd.concat(per_group).groupby(level=1, sort=False).median()
+              .reindex(index=data.columns, columns=data.columns))
+
+
+def correlation_matrix(frame, columns=None, exclude=(), method="pearson", by=None,
+                       min_periods=30, per_cluster=5):
+    """Pairwise r between one frame's columns, co-moving columns placed next to each other.
+    by: key column of a LONG frame (asset_symbol) — r is taken inside each group, median across groups;
+    min_periods: pairs sharing fewer rows stay NaN instead of printing a fluke r = ±1.
+    Order comes from EDA.correlation_clusters on the pooled rows (|r|; ordering only, not the values).
+    Returns: square DataFrame; a constant column is a NaN row and column."""
+    cols = correlation_columns(frame, columns, exclude, by)
+    data = frame[cols].apply(pd.to_numeric, errors="coerce")
+    corr = _correlation(data, method, frame[by] if by is not None else None, min_periods)
+    groups = EDA.correlation_clusters(data, cols, n_clusters=cluster_count(data, per_cluster),
+                                      method=method)
+    order = [c for g in groups.values() for c in g]
+    return corr.loc[order, order]
+
+
+def correlated_pairs(frame, columns=None, exclude=(), threshold=0.9, by=None,
+                     min_periods=30, methods=("pearson", "spearman")):
+    """Column pairs with |r| >= threshold under ANY of `methods`, strongest first.
+    Pearson next to Spearman: pearson high and spearman low means a few extreme rows carry the link.
+    same_base marks one feature at two windows ('x' and 'x__rolled_24h') — redundant by construction.
+    Returns: DataFrame [a, b, <one column per method>, max_abs_r, same_base]."""
+    cols = correlation_columns(frame, columns, exclude, by)
+    data = frame[cols].apply(pd.to_numeric, errors="coerce")
+    key = frame[by] if by is not None else None
+    r = {m: _correlation(data, m, key, min_periods).to_numpy() for m in methods}
+    i, j = np.triu_indices(len(cols), k=1)
+    names = np.array(cols)
+    pairs = pd.DataFrame({"a": names[i], "b": names[j], **{m: r[m][i, j] for m in methods}})
+    pairs["max_abs_r"] = pairs[list(methods)].abs().max(axis=1)
+    pairs["same_base"] = pairs["a"].map(base_name) == pairs["b"].map(base_name)
+    return (pairs[pairs["max_abs_r"] >= threshold]
+            .sort_values("max_abs_r", ascending=False, kind="stable").reset_index(drop=True))
+
+
+def plot_correlation(matrix, ax=None, title=None):
+    """Heatmap of a correlation_matrix(): red = positive, blue = negative, blank = undefined.
+    Returns: the matplotlib Axes."""
+    import matplotlib.pyplot as plt     # lazy, as in adv_validation: the value checks run without it
+    n = len(matrix)
+    if ax is None:
+        side = max(5, 0.3 * n)
+        _, ax = plt.subplots(figsize=(side + 1.5, side))
+    image = ax.imshow(matrix.to_numpy(), cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(matrix.columns, rotation=90, fontsize=7)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(matrix.index, fontsize=7)
+    ax.figure.colorbar(image, ax=ax, fraction=0.035)
+    if title:
+        ax.set_title(title)
+    return ax
