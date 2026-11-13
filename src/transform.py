@@ -517,12 +517,15 @@ def flat_exports(out_dir=OUTPUT_DIR):
 
 
 def save_batch(frames, out_dir=OUTPUT_DIR, batch=None, stage=None, index=False,
-               column=TIME_COL, n_rows=EDGE_ROWS, replace=True, manifest=True, verbose=True):
+               column=TIME_COL, n_rows=EDGE_ROWS, replace=True, manifest=True, verbose=True,
+               sources=None):
     """Write a set of frames as ONE batch: `<out_dir>/batch_<start>_<end>/<table>_<d0>_<d1>.csv`.
     frames: {table_name: DataFrame}; batch: force the folder's span instead of deriving it;
     stage: nest one level deeper, `batch_<span>/<stage>/`, so two stages writing into the
     same out_dir cannot collide; replace: drop this batch's older file for a table when the
-    dates in its name changed; manifest: also write `_manifest.json` beside the CSVs.
+    dates in its name changed; manifest: also write `_manifest.json` beside the CSVs;
+    sources: optional provenance written into the manifest (CombinedRun passes the batches
+    it joined, so a joined folder says which windows went in).
     Returns: a DataFrame, one row per table, with what was written and what it superseded.
 
     The span is derived, not passed: each frame is asked (via month_span) what it holds, and
@@ -600,12 +603,11 @@ def save_batch(frames, out_dir=OUTPUT_DIR, batch=None, stage=None, index=False,
             written = {entry["table"] for entry in manifest_rows}
             kept = [t for t in previous
                     if t.get("table") not in written and (target / t.get("file", "")).exists()]
-        manifest_path.write_text(json.dumps({
-            "batch": list(span),
-            "stage": stage,
-            "saved_utc": saved_utc,
-            "tables": kept + manifest_rows,
-        }, indent=2))
+        body = {"batch": list(span), "stage": stage, "saved_utc": saved_utc}
+        if sources is not None:
+            body["sources"] = sources
+        body["tables"] = kept + manifest_rows
+        manifest_path.write_text(json.dumps(body, indent=2))
 
     if verbose:
         print(f"wrote {len(report)} tables -> {target}/")
@@ -723,6 +725,99 @@ class BatchRun:
         return save_batch(frames, out_dir=out_dir, batch=self.span, **kwargs)
 
 
+class CombinedRun:
+    """Several batches joined into ONE timeline. Built by use_batch() when BATCH is a set/list.
+
+    Same interface as BatchRun (span, load, load_all, folder, save, loaded, tables), so a
+    notebook runs unchanged: load(table) returns the table from every batch stacked in time
+    order — the join happens BEFORE any processing, so rollups and forward targets run across
+    the seam instead of restarting at it. span is first start -> last end, so exports land in
+    their own folder (batch_2024-04_2026-03) and never overwrite a single-batch folder."""
+
+    def __init__(self, runs, source_dir=SOURCE_DIR):
+        self.runs = sorted(runs, key=lambda r: r.span)
+        self.span = (self.runs[0].span[0], self.runs[-1].span[1])
+        self.source_dir = source_dir
+        self.used = {}
+        common = set.intersection(*(set(r.paths) for r in self.runs))
+        self.paths = {label: [r.paths[label] for r in self.runs] for label in sorted(common)}
+
+    def __repr__(self):
+        joined = " + ".join(span_label(r.span) for r in self.runs)
+        return (f"<CombinedRun {span_label(self.span)} · joins {joined} · {len(self.paths)} "
+                f"tables in every batch · {len(self.used)} loaded · from {self.source_dir}/>")
+
+    def sources(self):
+        """Provenance for the manifest: each joined batch's span and folder."""
+        return [{"batch": list(r.span), "folder": batch_dir_name(r.span)} for r in self.runs]
+
+    def tables(self):
+        """Tables present in EVERY joined batch, one row each, files joined by ' + '."""
+        return pd.DataFrame({"label": list(self.paths),
+                             "file": [" + ".join(p.name for p in ps)
+                                      for ps in self.paths.values()]})
+
+    def load(self, table, column=TIME_COL):
+        """One table from every joined batch, stacked in time order.
+        Raises when a batch lacks the table, the columns differ, or two batches overlap in
+        time (a stamp would appear twice)."""
+        missing = [span_label(r.span) for r in self.runs if table not in r.paths]
+        if missing:
+            raise KeyError(f"'{table}' is missing from batch(es) {missing}. "
+                           f"Tables in every batch: {sorted(self.paths)}")
+        parts = [r.load(table) for r in self.runs]
+        first_cols = list(parts[0].columns)
+        for run, part in zip(self.runs[1:], parts[1:]):
+            if list(part.columns) != first_cols:
+                diff = sorted(set(first_cols) ^ set(part.columns)) or "same names, other order"
+                raise ValueError(f"'{table}': columns of {span_label(run.span)} differ from "
+                                 f"{span_label(self.runs[0].span)}: {diff}")
+        if column not in parts[0].columns:          # static reference: same file in every batch
+            self.used[table] = dict(self.runs[0].used[table])
+            return parts[0]
+        edges = [_edge_stamps(p, column=column) for p in parts]
+        for (a, ea), (b, eb) in zip(zip(self.runs, edges), zip(self.runs[1:], edges[1:])):
+            if not ea.empty and not eb.empty and ea.max() >= eb.min():
+                raise ValueError(f"'{table}': {span_label(a.span)} ends {ea.max()} but "
+                                 f"{span_label(b.span)} starts {eb.min()} — overlap")
+        frame = pd.concat(parts, ignore_index=True)
+        self.used[table] = {"table": table,
+                            "file": " + ".join(r.used[table]["file"] for r in self.runs),
+                            "rows": len(frame), "cols": frame.shape[1],
+                            "rows_per_batch": [len(p) for p in parts]}
+        return frame
+
+    def load_all(self, tables=None):
+        """Every table present in all joined batches (or the named subset), joined."""
+        return {label: self.load(label)
+                for label in (tables if tables is not None else self.paths)}
+
+    def path(self, table):
+        raise NotImplementedError("a joined run has no single file per table — in-place "
+                                  "rewrites (normalize) run per batch")
+
+    def folder(self, root, create=True):
+        """The joined run's folder under any root: '<root>/batch_<first start>_<last end>'."""
+        target = Path(root) / batch_dir_name(self.span)
+        if create:
+            target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def loaded(self):
+        """What this run has read so far, one row per table (files from every batch)."""
+        return pd.DataFrame(list(self.used.values()))
+
+    def save(self, frames, out_dir=OUTPUT_DIR, **kwargs):
+        """save_batch() under the joined span, with the joined batches in the manifest."""
+        kwargs.setdefault("sources", self.sources())
+        return save_batch(frames, out_dir=out_dir, batch=self.span, **kwargs)
+
+
+def _months_overlap(a, b):
+    """True when two (start_month, end_month) spans share a month."""
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
 def timelines(source_dir=SOURCE_DIR, **kwargs):
     """The selectable timelines in a folder, one row each — the menu for use_batch().
     Returns: DataFrame [batch, tables, first_date, last_date, select_with], oldest first.
@@ -752,8 +847,21 @@ def timelines(source_dir=SOURCE_DIR, **kwargs):
 
 def use_batch(batch=None, source_dir=SOURCE_DIR, include_static=True, **kwargs):
     """Pin a run to one timeline and return the BatchRun that owns its file list.
-    batch: see resolve_batch — None (newest), 'YYYY-MM', or a full span;
+    batch: see resolve_batch — None (newest), 'YYYY-MM', or a full span (tuple); or a SET/LIST
+    of those to join several batches into one CombinedRun (one entry -> a plain BatchRun);
     include_static: keep the window-independent tables (the decimal references) available."""
+    if isinstance(batch, (set, frozenset, list)):
+        if not batch:
+            raise ValueError("empty batch selection — name at least one batch")
+        groups = batches(source_dir, **kwargs)
+        spans = sorted({resolve_batch(b, groups) for b in batch})
+        for a, b in zip(spans, spans[1:]):
+            if _months_overlap(a, b):
+                raise ValueError(f"batches {span_label(a)} and {span_label(b)} overlap — "
+                                 f"pick one of them")
+        runs = [use_batch(span, source_dir=source_dir, include_static=include_static, **kwargs)
+                for span in spans]
+        return runs[0] if len(runs) == 1 else CombinedRun(runs, source_dir=source_dir)
     groups = batches(source_dir, **kwargs)
     if not groups:
         # Distinguish "empty folder" from "folder full of PRE-BATCH files", which is what a
@@ -859,6 +967,18 @@ def decimals_map(decimals, asset_col="asset", decimals_col="decimals", unit_col=
     return dict(decimals)
 
 
+def decimals_with_fallback(primary, fallback):
+    """One {asset: decimals} lookup from two references; `primary` wins where both have the asset.
+    primary, fallback: anything decimals_map accepts. Returns: dict.
+    Used where a metric-specific reference (e.g. flashloan_amount_raw) covers fewer assets than the
+    oracle table, whose `decimals` column is the same token property."""
+    out = decimals_map(fallback)
+    out = dict(out) if isinstance(out, dict) else {}
+    prim = decimals_map(primary)
+    out.update(prim if isinstance(prim, dict) else {})
+    return out
+
+
 def _scaled_name(col, suffix):
     """New column name for a scaled raw column: strip ``_raw``, else append suffix."""
     if col.endswith(RAW_SUFFIX):
@@ -876,10 +996,19 @@ def _scale_value(value, dec):
 
 
 def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
-                      decimals_col="decimals", drop_raw=False, suffix="_scaled"):
+                      decimals_col="decimals", drop_raw=False, suffix="_scaled",
+                      on_missing="warn"):
     """Divide raw integer-amount columns by 10**decimals -> real token units.
     decimals: int/dict/Series/DataFrame (see decimals_map); columns defaults to every *_raw;
-    asset_col, decimals_col, drop_raw, suffix. Returns: a NEW DataFrame."""
+    asset_col, decimals_col, drop_raw, suffix.
+    on_missing: what to do with a row that HAS a raw amount but whose asset has no decimals in the
+    reference -- "warn" (default) prints the assets and leaves NaN; "raise" stops. An asset with no
+    decimals AND no oracle price cannot be valued either way, so the default must not abort a batch.
+    Without this the amount scaled to NaN, the bucket sum treated it as 0, and a flashloan of a
+    real token showed as a transaction worth $0 (2024-04, 8 assets missing from the reference).
+    Returns: a NEW DataFrame."""
+    if on_missing not in ("raise", "warn"):
+        raise ValueError(f"on_missing must be 'raise' or 'warn', got {on_missing!r}")
 
     # NOTE: *_raw columns lose the suffix rather than gain one (supply_amount_raw -> supply_amount)
     cols = columns if columns is not None else raw_amount_columns(df)
@@ -893,6 +1022,17 @@ def scale_by_decimals(df, decimals, columns=None, asset_col="asset",
         dec_per_row = pd.Series(dmap, index=df.index)
     else:
         dec_per_row = df[asset_col].map(dmap)
+        has_amount = df[cols].notna().any(axis=1)
+        unmapped = df.loc[has_amount & dec_per_row.isna()]
+        if len(unmapped):
+            sym = "asset_symbol" if "asset_symbol" in unmapped.columns else asset_col
+            names = sorted(unmapped[sym].astype(str).unique())
+            msg = (f"scale_by_decimals: {len(unmapped)} row(s) hold a raw amount but their asset has no "
+                   f"decimals in the reference -> {names}. Add them to the reference (re-run that "
+                   f"decimal-reference query) or the amount scales to NaN and is later summed as 0.")
+            if on_missing == "raise":
+                raise ValueError(msg)
+            print("WARNING: " + msg)
 
     decs = list(dec_per_row)
     for col in cols:

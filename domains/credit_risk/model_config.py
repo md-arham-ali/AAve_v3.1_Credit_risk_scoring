@@ -47,13 +47,11 @@ SPLIT_FRACTIONS = (0.70, 0.15, 0.15)
 
 RANDOM_STATE = 42
 
-N_CV_SPLITS = 5
-
 SKEW_LOG1P_THRESHOLD = 2.5
 
 NEAR_CONSTANT_FRAC = 0.99
 
-REG_TARGET = "y_reg_log1p"
+REG_TARGET = "y_reg_score"     # the scaled 0-100 score as it is: no log on top of the scaling
 
 
 AGG_OVERRIDES = {
@@ -107,44 +105,51 @@ def rank_normalize(scores, reference):
 # =========================================================================== #
 # SECTION 2 — THE DOMAIN: credit-risk scoring
 # Everything below is specific to "will forward liquidation debt-covered USD
-# exceed the train p75 over the next 1/3/7 days?". This is the only section a new
+# exceed the train p75 over the next 24h/3d/7d?". This is the only section a new
 # domain rewrites.
 # =========================================================================== #
 
 DOMAIN_NAME = "credit_risk_scoring"
 
 # The raw column every target derives from — a real on-chain fact (dollars of debt
-# liquidators actually covered), time-shifted forward in
-# model_dataset.add_forward_targets to become the label.
+# liquidators actually covered), rolled forward over (t, t+h] by the targets section of
+# model_dataset.ipynb (model_dataset.forward_sums) to become the label.
 TARGET_BASE_COL = "liquidation_debt_covered_value_usd"
 
-HORIZONS = (1, 3, 7)
+# 2h panel, per-horizon embargo (model_split.py) — not the old daily (1, 3, 7).
+HORIZONS = ("24h", "3d", "7d", "15d")
 
-# Per-horizon train quantile of that horizon's OWN forward-max distribution. One
-# shared daily threshold made y_stress_7d ~76% positive; quantiling each horizon
-# separately holds every target near (1 - q) positives on train.
+# Per-horizon train quantile of that horizon's OWN forward-sum score. Quantiling each
+# horizon separately holds every target near (1 - q) positives on train.
 STRESS_QUANTILE = 0.75
 
 # Where this domain's results land. A second domain MUST change this or it will
 # overwrite these.
 MODEL_RESULTS_DIR = "model_results"
 
-# Where the model-stage DATA lands: model_data/batch_<start>_<end>/ with fixed file
-# names (DF_model_dataset_24h.csv, DF_model_{train,val,test}.csv, model_split_meta.json),
-# resolved per run by transform.BatchRun.folder(cfg.MODEL_DATA_DIR) — writers create=True,
-# readers create=False. One level below the batch folder with no dates in the names, so
-# neither transform's OUTPUT_PATTERN ("*/*.csv") nor any §1 resolver can see these files.
-# src/publish_bundle.py reads exactly this folder. A second domain MUST change this too.
+# Where the model-stage DATA lands: model_data/batch_<start>_<end>/ (DF_model_*_2h frames,
+# scaled_fixed/, scaled_causal/, split/split_meta.json), resolved per run by
+# transform.BatchRun.folder(cfg.MODEL_DATA_DIR). A second domain MUST change this too.
 MODEL_DATA_DIR = "model_data"
 
 # Priority score pushed into column_priority.json for this domain's features.
 FEATURE_PRIORITY = 2.0
 
-STRESS_TARGETS = tuple(f"y_stress_{h}d" for h in HORIZONS)
+# Matches model_split.stress_name()'s naming rule — one stress label per horizon,
+# shortest first; STRESS_TARGETS[0] ("…_24h") is the single horizon every
+# non-classifier runner (baselines, isolation forest, Cox, LSTM, transformer, PRI,
+# regressors) trains and evaluates on. Only run_classifier spans every horizon.
+STRESS_TARGETS = tuple(f"y_stress_{TARGET_BASE_COL}_{h}" for h in HORIZONS)
 
-# Label embargo: the widest horizon, so a row's forward-max window can never
-# reach across a split boundary.
-EMBARGO = max(HORIZONS)
+# Moving-block bootstrap block for the AUC CI, in ROWS: 84 = 7 days at the 2h grain. It has to
+# be longer than the label window, or the overlapping labels inside a window get resampled as
+# if independent and the CI comes out too narrow.
+CI_BLOCK_ROWS = 84
+
+# Bumped whenever what a saved result MEANS changes (2 = 2026-11-06: no log on the regressor
+# target, real-USD mae_usd, known-label persistence). Part of the run key, so results saved
+# before the change stop being read (model_persistence.load_model_results).
+RESULTS_SCHEMA = 2
 
 
 # Liquidation ratios that come out of the join as NA on zero-liquidation days. The

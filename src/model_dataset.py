@@ -1,7 +1,8 @@
-"""Modeling stage — daily credit-risk dataset assembly.
+"""Modeling stage — credit-risk dataset assembly.
 
-2h panel -> daily grain, joined with the 24h liq/user risk frames, restricted to
-the credit-risk feature set, plus the forward-looking stress/volume targets.
+2h panel + liq/user risk frames with trailing (backward) rollups for the FEATURES, and
+forward rollups over (t, t+h] for the TARGETS. Targets are kept apart from the features and
+joined on time_bucket only at train/val/test time (join_for_training).
 """
 
 # TODO: the 7d variant waits on more bulk data.
@@ -15,7 +16,7 @@ import pandas as pd
 import transform as tf
 import EDA as eda
 from data_validation import canonicalize_keys
-from domains.credit_risk.model_config import (TIME_COL, HORIZONS, TARGET_BASE_COL, REG_TARGET,
+from model_config import (TIME_COL,
                           LIQ_CONDITIONAL_COLS, CREDIT_RISK_COLS, CREDIT_RISK_WEIGHTS,
                           CREDIT_RISK_PRIORITY, AGG_OVERRIDES, AGG_RULES,
                           RATIO_RECIPES, SHARE_RECIPES)
@@ -95,6 +96,44 @@ def join_model_frames(daily, liq, user, time_col=TIME_COL):
     print(f" inner join: {len(merged)} rows kept, {dropped} dropped "
           f"(daily {len(daily)} / liq {len(liq)} / user {len(user)})")
     return merged
+
+
+def combine_frames(frames, time_col=TIME_COL):
+    """Merge several one-row-per-bucket frames into one, on time_col — e.g. the 4 scaled model
+    frames (panel/market/liq/user), each already at the panel's 2h grid.
+    frames: {label: frame}. Raises if any frame has a duplicate time_col stamp (one row per
+    bucket is required), or if a non-time_col column name appears in more than one frame —
+    nothing is ever silently overwritten; resolve a real duplicate (rename or drop it from one
+    side) before calling, the way join_model_frames does for its own 3 named frames.
+    Inner-joined in the order `frames` is given; a frame that narrows the join prints how many
+    rows were dropped, since all of them are expected to share the same grid.
+    Returns: one frame, time_col + every frame's columns, in `frames`' order."""
+    names = list(frames)
+    if not names:
+        raise ValueError("no frames given")
+    for name, df in frames.items():
+        dup = df[time_col].duplicated()
+        if dup.any():
+            raise AssertionError(f"'{name}': {int(dup.sum())} duplicate {time_col} stamp(s) — "
+                                 f"combine_frames needs one row per bucket")
+    owner = {}
+    for name, df in frames.items():
+        for col in df.columns:
+            if col == time_col:
+                continue
+            if col in owner:
+                raise ValueError(f"column '{col}' in both '{owner[col]}' and '{name}' — "
+                                 f"rename or drop it from one side before combining")
+            owner[col] = name
+    out = frames[names[0]]
+    for name in names[1:]:
+        before = len(out)
+        out = out.merge(frames[name], on=time_col, how="inner")
+        if len(out) != before:
+            print(f" combine_frames: '{name}' narrowed the join from {before} to {len(out)} rows")
+    print(f" combined {len(names)} frame(s) ({', '.join(names)}) on '{time_col}': "
+          f"{out.shape[0]} rows x {out.shape[1]} cols")
+    return out
 
 
 def fill_conditional_zeros(df, columns=LIQ_CONDITIONAL_COLS, indicator_col="has_liquidation",
@@ -180,6 +219,61 @@ def align_to_grid(df, grid, fill=None, time_col=TIME_COL):
     return out
 
 
+def pivot_wide_by_group(df, group_col, value_cols, groups=None, time_col=TIME_COL, sep="_"):
+    """Pivot a long per-group frame to wide: one row per time_col stamp, one column per
+    (value column, group) pair, named f"{value_col}{sep}{group}" (e.g. rate_change_WBTC).
+    df: the long frame, at most one row per (time_col, group_col) pair (e.g. the market panel,
+    one row per asset per bucket); group_col: the column identifying each group (e.g.
+    asset_symbol), itself dropped from value_cols if listed; value_cols: the columns to pivot
+    out; groups: the exact groups and their column order (e.g. the notebook's selected_tokens)
+    — a bucket missing one group still gets that group's columns, as NaN, instead of silently
+    narrowing the frame; None falls back to the groups found in df, sorted.
+    Raises on a duplicated (time_col, group_col) row — a pivot would otherwise silently pick
+    one and drop the rest. Prints how many (stamp, group, value-column) cells came out NaN —
+    a bucket where a group is simply missing, not a bug, but worth seeing.
+    Returns: a frame with time_col + one column per value_col x group, value-major
+    (every group of the first value_col, then every group of the second, ...)."""
+    value_cols = [c for c in value_cols if c != group_col]
+    dup = df.duplicated([time_col, group_col])
+    if dup.any():
+        n = int(dup.sum())
+        raise AssertionError(f"{n} duplicate ({time_col}, {group_col}) row(s) — a pivot "
+                             f"would silently pick one and drop the rest")
+    groups = sorted(df[group_col].unique()) if groups is None else list(groups)
+    wide = df.pivot(index=time_col, columns=group_col, values=value_cols)
+    wide.columns = [f"{v}{sep}{g}" for v, g in wide.columns]
+    ordered = [f"{v}{sep}{g}" for v in value_cols for g in groups]
+    for c in ordered:
+        if c not in wide.columns:
+            wide[c] = np.nan
+    wide = wide[ordered]
+    n_nan = int(wide.isna().sum().sum())
+    print(f" pivoted {len(value_cols)} column(s) x {len(groups)} group(s) -> "
+          f"{wide.shape[1]} wide column(s), {n_nan} missing cell(s)")
+    return wide.reset_index()
+
+
+def capped_ffill(df, columns=None, limit=3, time_col=TIME_COL):
+    """Forward-fill NaN up to `limit` consecutive buckets, treating a gap as "no update" (the
+    last known value still holds) rather than missing data — valid for state/rate columns
+    (e.g. a wide market pivot), never for counts or event flags, where a gap means zero.
+    columns: which to fill, None = every column except time_col. A run of NaN longer than
+    `limit` stays NaN past the cap, so a real, longer coverage gap is never hidden as a
+    made-up flat line. Prints how many of the NaN cells got filled vs. left beyond the cap.
+    Returns: a copy of df, in its original row order, with the fill applied."""
+    frame, rank = _as_time_index(df, time_col=time_col)
+    cols = [c for c in (columns if columns is not None else df.columns) if c != time_col]
+    before = int(frame[cols].isna().sum().sum())
+    filled = frame[cols].ffill(limit=limit)
+    after = int(filled.isna().sum().sum())
+    out = df.copy()
+    out[cols] = filled.to_numpy()[rank]
+    print(f" forward-filled up to {limit} bucket(s) (assumed unchanged): "
+          f"{before - after} of {before} NaN cell(s) filled across {len(cols)} column(s), "
+          f"{after} left NaN beyond the cap")
+    return out
+
+
 def sync_priorities(weights=None):
     """Push the tiered CREDIT_RISK_WEIGHTS into column_priority.json (the EDA map).
     Replaces the old flat 2.0 sync — one weighting scheme for the whole project.
@@ -204,24 +298,6 @@ def select_credit_risk_columns(df, source="constant", threshold=CREDIT_RISK_PRIO
         print(f" ⚠️ {len(missing)} expected credit-risk columns missing: {missing}")
     print(f" selected {len(present)} credit-risk feature columns")
     return present
-
-
-def add_forward_targets(df, target_col=TARGET_BASE_COL, horizons=HORIZONS, time_col=TIME_COL):
-    """Add forward-looking targets and trim the incomplete trailing window.
-    target_next_1d = t+1; target_fwd_max_{h}d = max over t+1..t+h; y_reg_log1p = log1p of the former.
-    Returns: the frame minus the last max(horizons) rows (count printed)."""
-
-    # binarization into y_stress_{h}d waits until after the split — keeps the threshold train-only
-    out = df.sort_values(time_col, kind="stable").reset_index(drop=True).copy()
-    s = out[target_col].astype(float)
-    out["target_next_1d"] = s.shift(-1)
-    for h in horizons:
-        fwd = s[::-1].rolling(h, min_periods=h).max()[::-1].shift(-1)
-        out[f"target_fwd_max_{h}d"] = fwd
-    out[REG_TARGET] = np.log1p(out["target_next_1d"])
-    trim = max(horizons)
-    print(f" dropped {trim} trailing rows with incomplete forward windows")
-    return out.iloc[:-trim].reset_index(drop=True)
 
 
 def load_pinned_frames(run, tables, expect_cols=None, time_col=TIME_COL):
@@ -290,7 +366,7 @@ def reconcile_model_sources(frames, checks=RECONCILE_CHECKS, time_col=TIME_COL):
 #
 # SEVERAL WINDOWS IN ONE CALL. Every function below takes `window` as either a single span or
 # a sequence of them (TRAILING_WINDOWS), and writes one column per (column, window) pair named
-# by trailing_name — borrow_tx_count_trail_12h / _trail_3d / _trail_7d. One pass over the
+# by trailing_name — borrow_tx_count_trail_12h / _trail_3d / _trail_7d / _trail_15d. One pass over the
 # sorted frame serves all of them. To choose the names, put WINDOW_FIELD in the suffix:
 # suffix='rolled_{window}' gives _rolled_24h for one window and _rolled_12h / _rolled_3d /
 # _rolled_7d for three, so a notebook switches window sets by changing ONE constant, and
@@ -299,16 +375,17 @@ def reconcile_model_sources(frames, checks=RECONCILE_CHECKS, time_col=TIME_COL):
 # with no '{window}' across several windows, and a suffix mapping that sends two windows to
 # one name.
 #
-# These windows NEST: 12h sits inside 3d sits inside 7d, so the three sums are correlated by
-# construction (measured on this batch: log corr 0.70 between the nested 7d and 15d totals).
+# These windows NEST: 12h sits inside 3d sits inside 7d sits inside 15d, so the sums are
+# correlated by construction (measured on this batch: log corr 0.70 between the nested 7d and
+# 15d totals).
 # That is fine for prediction and misleading for interpretation. If the point is to separate
 # "what just happened" from "what happened earlier in the week", difference the bands
 # (3d minus 12h, 7d minus 3d) rather than feeding the nested totals in as they are.
 TRAILING_WINDOW = "24h"
 
-# The vetted multi-window set — short / medium / week-long trailing context on one frame.
-# Not a default: every function still defaults to the single TRAILING_WINDOW, so existing
-# call sites are unchanged. Pass window=TRAILING_WINDOWS to get all three.
+# The vetted multi-window set — short / medium / week-long / fortnightly trailing context on
+# one frame. Not a default: every function still defaults to the single TRAILING_WINDOW, so
+# existing call sites are unchanged. Pass window=TRAILING_WINDOWS to get all four.
 TRAILING_WINDOWS = ("12h", "3d", "7d")
 
 # Placeholder a suffix (or a trailing_rows name) may carry; filled with each window's label.
@@ -360,14 +437,14 @@ def _label_of(window):
 def as_windows(window=TRAILING_WINDOW):
     """One window or several -> an ordered tuple of (label, pd.Timedelta), each via as_window.
     window: a single fixed span ('7d', pd.Timedelta('7d')) or a sequence of them
-    (TRAILING_WINDOWS = ('12h', '3d', '7d')). Order is kept as given, so pass a list or tuple
+    (TRAILING_WINDOWS = ('12h', '3d', '7d', '15d')). Order is kept as given, so pass a list or tuple
     rather than a set — it is the order the output columns are written in.
     Two entries of the same LENGTH are refused — they would compute identical numbers twice.
     Returns: ((label, Timedelta), …); raises ValueError on an empty or duplicated set."""
     items = list(window) if _is_sequence(window) else [window]
     if not items:
         raise ValueError("no window given — pass a span such as '24h', or a sequence "
-                         "such as TRAILING_WINDOWS ('12h', '3d', '7d')")
+                         "such as TRAILING_WINDOWS ('12h', '3d', '7d', '15d')")
     pairs, seen = [], {}
     for item in items:
         label, delta = _label_of(item)
@@ -493,6 +570,21 @@ def trailing_name(column, window=TRAILING_WINDOW, suffix=None):
     if not suffix:
         return f"{column}_trail_{label}"
     return f"{column}_{suffix.replace(WINDOW_FIELD, label)}"
+
+
+def window_suffixes(window=TRAILING_WINDOW, suffix=None):
+    """The suffix string for each window in `window`, via the suffix template — trailing_name's
+    naming rule without a column name. 'rolled_{window}' + TRAILING_WINDOWS ->
+    ('rolled_12h', 'rolled_3d', 'rolled_7d', 'rolled_15d'). Reuses _per_window's validation
+    (refuses a plain suffix across several windows, a bad {window: suffix} mapping, etc.), so a
+    caller that only needs the NAMES (never the column) — matching rolled columns to a base
+    feature, say — doesn't have to invent a dummy column just to call trailing_name.
+    window: one span or a sequence of them, as trailing_sum.
+    Returns: a tuple of suffix strings, one per window, in the order given."""
+    windows = as_windows(window)
+    resolved = [_per_window(suffix, label, delta, len(windows)) for label, delta in windows]
+    return tuple(r.replace(WINDOW_FIELD, label) if r else f"trail_{label}"
+                for (label, _), r in zip(windows, resolved))
 
 
 def trailing_sum(df, column, window=TRAILING_WINDOW, time_col=TIME_COL, suffix=None,
@@ -662,4 +754,283 @@ def trailing_sums(df, columns, window=TRAILING_WINDOW, time_col=TIME_COL, suffix
     print(f" trailing {_shown(windows)} sums added for {len(columns)} column(s)"
           + (f" ({len(columns) * len(windows)} columns)" if len(windows) > 1 else "")
           + f" · grain {frame_grain(df, time_col=time_col)}, a full window covers {full} row(s)")
+    return out
+
+
+def fill_trailing_mean(df, columns, window="7d", weight=None, weighted=(), time_col=TIME_COL,
+                       flag_suffix="_was_missing"):
+    """Fill blank cells with the mean of the column over the trailing window (t - window, t] —
+    past values only, so a filled row never reads anything after t, and the result is the
+    same for any split. weighted: columns averaged with `weight` (sampled_user_count for
+    per-bucket user averages); the rest take the plain mean.
+    Adds <col><flag_suffix> = 1 where the cell was blank (filled or not). A cell with no
+    observed value in its window stays blank — the first `window` of the frame, mostly.
+    Returns: a copy of df; only columns that had a blank are touched."""
+    columns = [c for c in columns if df[c].isna().any()]
+    weighted = [c for c in columns if c in set(weighted)]
+    if weighted and weight is None:
+        raise ValueError("weighted columns given without a weight column")
+    suffix = f"fill_{WINDOW_FIELD}"
+    out = df.copy()
+    blank_before = int(df[columns].isna().sum().sum())
+    for cols, w in ((weighted, weight), ([c for c in columns if c not in weighted], None)):
+        if not cols:
+            continue
+        means = trailing_means(df, cols, window=window, weight=w, time_col=time_col, suffix=suffix)
+        for c in cols:
+            out[f"{c}{flag_suffix}"] = df[c].isna().astype("int8")
+            out[c] = df[c].fillna(means[trailing_name(c, window, suffix)])
+    left = int(out[columns].isna().sum().sum())
+    print(f" trailing {window} fill: {len(columns)} column(s) had blanks, {blank_before - left} "
+          f"cell(s) filled, {left} still blank, {len(columns)} '{flag_suffix}' flag(s) added")
+    return out
+
+
+# --- forward windows (TARGETS only) ------------------------------------------------- #
+# The mirror of the trailing block: for a row stamped t, a forward window covers the rows
+# stamped in (t, t + window]. t itself is EXCLUDED (it is known when the prediction is made)
+# and t + window is included, so a target never holds the row it is predicted from. Windows
+# are TIME spans, as above. A row whose window runs past the last stamp of the frame is left
+# NaN — PENDING: its future has not been observed yet. Those rows are the prediction rows, and
+# they are scored once the next batch is loaded and the targets rebuilt over old + new data.
+# Targets live in their own frame (DF_target_*), never inside DF_model_*.
+TARGET_WINDOWS = ("24h", "3d", "7d", "15d")
+FORWARD_SUFFIX = f"fwd_{WINDOW_FIELD}"            # liquidation_debt_covered_value_usd_fwd_24h
+
+
+def _forward_window_sum(series, delta, min_periods=1):
+    """Sum of a TIME-SORTED, time-indexed series over (t, t + delta], per row.
+    Built from running totals and a search on the stamps, so gaps are handled by time.
+    NaNs are skipped, not read as 0. A row gets NaN when its window runs past the last stamp
+    (pending) or holds fewer than min_periods observed values (unobserved).
+    Returns: a float Series on the same index."""
+    x = series.astype(float)
+    if x.empty:
+        return x
+    stamps = x.index.asi8
+    lo = np.searchsorted(stamps, stamps, side="right")                 # first row after t
+    hi = np.searchsorted(stamps, stamps + delta.value, side="right")   # last row <= t + delta
+    total = np.concatenate([[0.0], np.cumsum(x.fillna(0.0).to_numpy())])
+    seen = np.concatenate([[0], np.cumsum(x.notna().to_numpy())])
+    summed, observed = total[hi] - total[lo], seen[hi] - seen[lo]
+    pending = stamps + delta.value > stamps[-1]
+    return pd.Series(np.where(~pending & (observed >= min_periods), summed, np.nan), index=x.index)
+
+
+def forward_sum(df, column, window=TARGET_WINDOWS, time_col=TIME_COL, suffix=FORWARD_SUFFIX,
+                min_periods=1):
+    """Add the forward sum of ONE additive column over (t, t + window], per window —
+    trailing_sum looking the other way. window: one span or a sequence (TARGET_WINDOWS);
+    suffix: as trailing_sum, default 'fwd_{window}'. df is not mutated, row order is kept.
+    Returns: a copy of df with one new column per window."""
+    if column not in df.columns:
+        raise KeyError(f"'{column}' not in the frame; columns: {list(df.columns)[:8]}")
+    windows = as_windows(window)
+    names = _output_names(column, windows, suffix)
+    indexed, rank = _as_time_index(df, time_col=time_col)
+    out = df.copy()
+    for (_, delta), name in zip(windows, names):
+        out[name] = _forward_window_sum(indexed[column], delta, min_periods).to_numpy()[rank]
+    return out
+
+
+def forward_sums(df, columns, window=TARGET_WINDOWS, time_col=TIME_COL, suffix=FORWARD_SUFFIX,
+                 min_periods=1):
+    """forward_sum over several additive columns (flows, USD totals).
+    Returns: a copy of df with one forward column per (column, window) pair."""
+    windows = as_windows(window)
+    columns = list(columns)
+    out = df
+    for column in columns:
+        out = forward_sum(out, column, window=window, time_col=time_col, suffix=suffix,
+                          min_periods=min_periods)
+    print(f" forward {_shown(windows)} sums added for {len(columns)} column(s)"
+          + (f" ({len(columns) * len(windows)} columns)" if len(windows) > 1 else ""))
+    return out
+
+
+def forward_means(df, columns, window=TARGET_WINDOWS, weight=None, time_col=TIME_COL,
+                  suffix=FORWARD_SUFFIX, min_periods=1):
+    """Forward mean of state columns (avg_*) over (t, t + window] — trailing_means looking the
+    other way. weight: optional column (sampled_user_count) giving sum(w * x) / sum(w);
+    a row enters only where the column (and the weight) is observed.
+    Returns: a copy of df with one column per input column PER WINDOW."""
+    windows = as_windows(window)
+    columns = list(columns)
+    missing = [c for c in (*columns, *([weight] if weight else [])) if c not in df.columns]
+    if missing:
+        raise KeyError(f"column(s) {missing} not in the frame")
+    targets = {column: _output_names(column, windows, suffix) for column in columns}
+    indexed, rank = _as_time_index(df, time_col=time_col)
+    w = (indexed[weight].astype(float) if weight
+         else pd.Series(1.0, index=indexed.index))
+    out = df.copy()
+    for column in columns:
+        x = indexed[column].astype(float)
+        seen = x.notna() & w.notna()
+        weighted, mass = (x * w).where(seen), w.where(seen)
+        for (_, delta), name in zip(windows, targets[column]):
+            total = _forward_window_sum(weighted, delta, min_periods)
+            denom = _forward_window_sum(mass, delta, min_periods)
+            out[name] = (total / denom.replace(0, np.nan)).to_numpy()[rank]
+    print(f" forward {_shown(windows)} means added for {len(columns)} column(s)"
+          + (f" ({len(columns) * len(windows)} columns)" if len(windows) > 1 else "")
+          + (f", weighted by {weight}" if weight else ""))
+    return out
+
+
+def forward_ratio_of_sums(df, recipes, window=TARGET_WINDOWS, time_col=TIME_COL,
+                          suffix=FORWARD_SUFFIX, min_periods=1, weight=None):
+    """Ratio columns as sum(num) / sum(dens) over (t, t + window] — ratio_of_sums looking the
+    other way. recipes: {name: (num, den)} or {name: (num, (den_a, den_b))}; weight: as
+    ratio_of_sums, for operands that are per-row averages. A bucket enters only if EVERY
+    operand (and the weight) was observed there. Zero denominator -> NaN.
+    Returns: a copy of df with one column per recipe PER WINDOW."""
+    windows = as_windows(window)
+    if weight is not None and weight not in df.columns:
+        raise KeyError(f"weight '{weight}' not in the frame")
+    frame, rank = _as_time_index(df, time_col=time_col)
+    out = df.copy()
+    for name, recipe in recipes.items():
+        num, dens = _ratio_operands(recipe)
+        cols = list(dict.fromkeys((num, *dens)))
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise KeyError(f"{name}: operand(s) {missing} not in the frame")
+        parts = frame[cols].astype(float)
+        seen = parts.notna().all(axis=1)
+        if weight is not None:
+            w = frame[weight].astype(float)
+            seen &= w.notna()
+            parts = parts.mul(w, axis=0)
+        parts = parts.where(seen)
+        for (_, delta), col in zip(windows, _output_names(name, windows, suffix)):
+            summed = pd.DataFrame({c: _forward_window_sum(parts[c], delta, min_periods)
+                                   for c in cols})
+            out[col] = _divide(summed, num, dens).to_numpy()[rank]
+    print(f" {len(recipes)} ratio(s) rebuilt as forward ratio-of-sums over {_shown(windows)}"
+          + (f" ({len(recipes) * len(windows)} columns)" if len(windows) > 1 else "")
+          + (f", weighted by {weight}" if weight else ""))
+    return out
+
+
+def _target_window(column):
+    """The forward window a target column was built over: 'x_fwd_3d' -> Timedelta('3d')."""
+    head, sep, label = column.rpartition("_fwd_")
+    if not sep:
+        raise ValueError(f"'{column}' is not a forward target (no '_fwd_<window>' suffix)")
+    return as_window(label)
+
+
+def target_pending(targets, column, time_col=TIME_COL):
+    """True where the target's window runs past the frame's last stamp — the prediction rows."""
+    stamps = _to_utc(targets[time_col])
+    return (stamps + _target_window(column) > stamps.max()).to_numpy()
+
+
+def target_status(targets, time_col=TIME_COL):
+    """Per target column: rows labelled, pending (window past the data -> to predict) and
+    unobserved (window inside the data but nothing observed in it, e.g. no sampled user).
+    Returns: DataFrame [column, window, labelled, pending, unobserved, first_pending]."""
+    stamps = _to_utc(targets[time_col])
+    rows = []
+    for col in [c for c in targets.columns if "_fwd_" in c]:
+        pending = target_pending(targets, col, time_col)
+        known = targets[col].notna().to_numpy()
+        rows.append({"column": col, "window": col.rpartition("_fwd_")[2],
+                     "labelled": int(known.sum()), "pending": int(pending.sum()),
+                     "unobserved": int((~known & ~pending).sum()),
+                     "first_pending": stamps[pending].min() if pending.any() else pd.NaT})
+    return pd.DataFrame(rows)
+
+
+def grid_gaps(df, time_col=TIME_COL):
+    """Missing stretches in a DENSE frame's time grid (the 2h panel), e.g. the seam where two
+    joined batches meet. Any step between consecutive stamps wider than the frame's grain is a gap.
+    Returns: DataFrame [last_before, first_after, missing_buckets], empty when the grid is whole
+    (a single batch)."""
+    cols = ["last_before", "first_after", "missing_buckets"]
+    grain = frame_grain(df, time_col=time_col)
+    if pd.isna(grain):
+        return pd.DataFrame(columns=cols)
+    stamps = _to_utc(df[time_col]).sort_values().reset_index(drop=True)
+    step = stamps.diff()
+    wide = step > grain
+    out = pd.DataFrame({"last_before": stamps.shift(1)[wide].to_numpy(),
+                        "first_after": stamps[wide].to_numpy(),
+                        "missing_buckets": (step[wide] // grain - 1).astype(int).to_numpy()})
+    print(f" {len(out)} gap(s) in the {grain} grid"
+          + (f", {int(out['missing_buckets'].sum())} bucket(s) missing" if len(out) else ""))
+    return out
+
+
+def blank_across_gaps(targets, gaps, time_col=TIME_COL):
+    """Blank (NaN) every forward target whose window (t, t+h] holds a missing bucket.
+    Over a hole a forward SUM reads 'nothing happened' (a fake 0 liquidation label), so those
+    labels are dropped rather than trusted. Blanked rows sit inside the data, so target_status
+    counts them as unobserved, not pending. gaps: grid_gaps() of the grid the targets were
+    built on; no gaps -> the frame comes back unchanged.
+    Returns: a copy of targets."""
+    out = targets.copy()
+    if gaps is None or gaps.empty:
+        return out
+    stamps = _to_utc(out[time_col])
+    grain = frame_grain(out, time_col=time_col)
+    blanked = {}
+    for col in [c for c in out.columns if "_fwd_" in c]:
+        h = _target_window(col)
+        hit = np.zeros(len(out), dtype=bool)
+        for before, after in zip(gaps["last_before"], gaps["first_after"]):
+            first_missing, last_missing = before + grain, after - grain
+            # (t, t+h] holds a missing stamp m  <=>  t < m <= t+h for some m in the hole
+            hit |= ((stamps < last_missing) & (stamps + h >= first_missing)).to_numpy()
+        newly = hit & out[col].notna().to_numpy()
+        out.loc[hit, col] = np.nan
+        blanked[col] = int(newly.sum())
+    print(f" blanked targets whose window crosses a gap: {blanked}")
+    return out
+
+
+def assert_separate(features, targets, time_col=TIME_COL):
+    """Raise when the feature frame carries anything from the target side: a forward column,
+    a column the target frame also has, or a target's base column or rolled copy
+    (avg_ltv, avg_ltv_rolled_24h for target avg_ltv_fwd_*)."""
+    bases = {c.rpartition("_fwd_")[0] for c in targets.columns if "_fwd_" in c}
+    leaked = [c for c in features.columns if c != time_col and (
+        "_fwd_" in c or c in targets.columns
+        or any(c == b or c.startswith(f"{b}_") for b in bases))]
+    if leaked:
+        raise AssertionError(f"features carry target column(s) {leaked}; targets must stay in "
+                             f"DF_target_* until the join")
+
+
+def _check_separate(features, targets, target_col, time_col):
+    """assert_separate, plus the target column must exist."""
+    if target_col not in targets.columns:
+        raise KeyError(f"'{target_col}' not in the target frame")
+    assert_separate(features, targets, time_col)
+
+
+def join_for_training(features, targets, target_col, time_col=TIME_COL):
+    """Features + ONE target column, joined on time_bucket — the only place the two meet.
+    Keeps only rows whose target is known (pending and unobserved rows dropped), so another
+    target, or another model's prediction, can never enter as a feature.
+    features may hold several rows per stamp (the per-asset market frame).
+    Returns: features + target_col, labelled rows only."""
+    _check_separate(features, targets, target_col, time_col)
+    t = targets[[time_col, target_col]].assign(_t=_to_utc(targets[time_col]))
+    f = features.assign(_t=_to_utc(features[time_col]))
+    out = f.merge(t.drop(columns=[time_col]), on="_t", how="inner", validate="many_to_one")
+    out = out[out[target_col].notna()].drop(columns=["_t"]).reset_index(drop=True)
+    print(f" joined {target_col}: {len(out)} labelled row(s) of {len(features)}")
+    return out
+
+
+def prediction_rows(features, targets, target_col, time_col=TIME_COL):
+    """The feature rows to predict for target_col: stamps whose forward window is pending.
+    Returns: those feature rows (no target column)."""
+    _check_separate(features, targets, target_col, time_col)
+    pending = _to_utc(targets[time_col])[target_pending(targets, target_col, time_col)]
+    out = features[_to_utc(features[time_col]).isin(pending)].reset_index(drop=True)
+    print(f" {target_col}: {len(out)} row(s) to predict")
     return out

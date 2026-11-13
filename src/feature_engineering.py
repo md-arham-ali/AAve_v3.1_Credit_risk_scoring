@@ -491,12 +491,20 @@ def correlation_matrix(frame, columns=None, exclude=(), method="pearson", by=Non
     return corr.loc[order, order]
 
 
-def correlated_pairs(frame, columns=None, exclude=(), threshold=0.9, by=None,
+def correlated_pairs(frame, columns=None, exclude=(), threshold=0.9, direction="above", by=None,
                      min_periods=30, methods=("pearson", "spearman")):
-    """Column pairs with |r| >= threshold under ANY of `methods`, strongest first.
+    """Column pairs whose |r| crosses `threshold` under ANY of `methods`.
+    direction: "above" (default) keeps |r| >= threshold, strongest first — redundancy candidates.
+    "below" keeps |r| <= threshold instead, weakest first — near-independent pairs, the read for
+    "are these two actually carrying different signal". Same machinery either way: a NaN
+    max_abs_r (a constant column, or too few shared rows) satisfies neither comparison, so it is
+    excluded from both reads, not just "above".
     Pearson next to Spearman: pearson high and spearman low means a few extreme rows carry the link.
-    same_base marks one feature at two windows ('x' and 'x__rolled_24h') — redundant by construction.
+    same_base marks one feature at two windows ('x' and 'x__rolled_24h') — redundant by
+    construction, so it is never informative in a "below" read.
     Returns: DataFrame [a, b, <one column per method>, max_abs_r, same_base]."""
+    if direction not in ("above", "below"):
+        raise ValueError(f"direction must be 'above' or 'below', got {direction!r}")
     cols = correlation_columns(frame, columns, exclude, by)
     data = frame[cols].apply(pd.to_numeric, errors="coerce")
     key = frame[by] if by is not None else None
@@ -506,8 +514,10 @@ def correlated_pairs(frame, columns=None, exclude=(), threshold=0.9, by=None,
     pairs = pd.DataFrame({"a": names[i], "b": names[j], **{m: r[m][i, j] for m in methods}})
     pairs["max_abs_r"] = pairs[list(methods)].abs().max(axis=1)
     pairs["same_base"] = pairs["a"].map(base_name) == pairs["b"].map(base_name)
-    return (pairs[pairs["max_abs_r"] >= threshold]
-            .sort_values("max_abs_r", ascending=False, kind="stable").reset_index(drop=True))
+    kept = pairs["max_abs_r"] >= threshold if direction == "above" else pairs["max_abs_r"] <= threshold
+    return (pairs[kept]
+            .sort_values("max_abs_r", ascending=(direction == "below"), kind="stable")
+            .reset_index(drop=True))
 
 
 def plot_correlation(matrix, ax=None, title=None):

@@ -10,6 +10,13 @@ import os
 
 DEFAULT_URI = "http://localhost:5001"    # host-side; in-container it is http://mlflow:5001
 
+# mlflow's REST client defaults to a 120s-per-request timeout and 5 retries — against a
+# server that's simply not running, that's 120s+ of silent hanging before the except below
+# even fires, which reads as the NOTEBOOK being stuck, not "MLflow is off". setdefault: an
+# operator's own tighter/looser env var setting is never overridden.
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "3")
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
+
 _ENABLED = None          # None = not yet probed
 _mlflow = None
 
@@ -70,7 +77,7 @@ def flatten_metrics(result):
             out[key] = float(val)
 
     for target, per_split in (result.get("targets") or {}).items():
-        h = target.replace("y_stress_", "")            # "1d" / "3d" / "7d"
+        h = target.rpartition("_")[2]                  # "24h" / "3d" / "7d" / "15d"
         for split, m in per_split.items():
             for name, val in m.items():
                 _put(f"{split}_{name}_{h}", val)
@@ -93,7 +100,8 @@ def flatten_metrics(result):
 
 def log_model_result(result, split_meta=None, extra_tags=None, run_name=None):
     """Log ONE runner result as ONE MLflow run.
-    result: a runner's return dict; split_meta: model_split_meta.json; extra_tags: {str: str}.
+    result: a runner's return dict; split_meta: split_meta.json (model_split.py — per-horizon
+    embargo, selection, stress thresholds keyed by forward column); extra_tags: {str: str}.
     Returns: the run id, or None when tracking is off."""
     mlflow = _client()
     if mlflow is None:
@@ -116,11 +124,13 @@ def log_model_result(result, split_meta=None, extra_tags=None, run_name=None):
 
         # without these, runs from different splits are indistinguishable in the UI
         if split_meta:
-            mlflow.log_param("embargo_days", split_meta.get("embargo_days"))
-            mlflow.log_param("split_fractions", split_meta.get("split_fractions"))
-            mlflow.log_param("n_features", len(split_meta.get("feature_cols", [])))
-            for h, thr in (split_meta.get("thresholds") or {}).items():
-                mlflow.log_param(f"stress_threshold_{h}d", thr)
+            mlflow.log_param("embargo", split_meta.get("embargo"))
+            mlflow.log_param("fractions", split_meta.get("fractions"))
+            selection = split_meta.get("selection") or {}
+            mlflow.log_param("n_features", len(selection.get("kept", split_meta.get("feature_cols", []))))
+            for col, th in (split_meta.get("stress", {}).get("thresholds") or {}).items():
+                h = col.rpartition("_fwd_")[2]
+                mlflow.log_param(f"stress_threshold_{h}", th.get("threshold"))
 
         metrics = flatten_metrics(result)
         if metrics:

@@ -1076,19 +1076,44 @@ def tf_tier1_domain(df):
 
 
 # --- Tier 2: intra-row logical invariants ---
-def _zero_coupling(df, anchor, amount_members, count_members, cap=10):
+def unpriced_event_buckets(events, oracle, time_col="time_bucket", asset_col="asset",
+                           price_col="avg_price_usd"):
+    """Buckets whose events can NOT be valued: every event row's asset has no oracle price in that bucket.
+    events: a raw event table (flashloan, ...); oracle: the oracle table (bucket, asset, price).
+    Returns: set of "YYYY-MM-DD HH:MM:SS.000 UTC" stamps -- the frame's own canonical form.
+    Why: the protocol frame sums an unvalued amount as 0 (E27 forbids nulls), so "1 flashloan, $0" is
+    indistinguishable from a bug. A bucket where NO row could be priced is unknown, not wrong; a bucket
+    with at least one priced row is NOT in this set and is still checked."""
+    def _canon(s):
+        return pd.to_datetime(s.astype(str).str.replace(" UTC", "", regex=False), utc=True)
+    ev = pd.DataFrame({"t": _canon(events[time_col]),
+                       "a": events[asset_col].astype(str).str.lower()})
+    px = oracle[oracle[price_col].notna()]
+    priced = set(zip(_canon(px[time_col]), px[asset_col].astype(str).str.lower()))
+    ev["priced"] = [(t, a) in priced for t, a in zip(ev["t"], ev["a"])]
+    unknown = ev.groupby("t")["priced"].any()
+    return {t.strftime("%Y-%m-%d %H:%M:%S.000 UTC") for t in unknown.index[~unknown.values]}
+
+
+def _zero_coupling(df, anchor, amount_members, count_members, cap=10, skip=None):
     """count <=> amount <=> uniques coupling per family.
     Per row with the anchor present: anchor == 0 => all members 0; anchor > 0 => all members > 0.
-    Returns: the tidy check row. All-null rows are excluded and reported separately."""
+    skip: bucket stamps whose amounts are unknown (see unpriced_event_buckets) -- counted, not checked.
+    Returns: the tidy check row inputs. All-null rows are excluded and reported separately."""
 
     # that exclusion is the 'quiet bucket vs pipeline gap' distinction — a structural zero
     # must never be confused with a missing row
     members = amount_members + count_members
     a = _col_numbers(df, anchor)
     M = {m: _col_numbers(df, m) for m in members}
-    n_checked = n_fail = n_null = n_zero = n_active = 0
+    n_checked = n_fail = n_null = n_zero = n_active = n_skip = 0
     mask = [False] * len(df)
+    skip = skip or set()
+    stamps = df["time_bucket"].astype(str).tolist() if skip else None
     for i in range(len(df)):
+        if skip and stamps[i] in skip and (a[i] or 0) > 0:
+            n_skip += 1                                          # active but unvalueable: unknown, not wrong
+            continue
         av = a[i]
         mv = [M[m][i] for m in members]
         if av is None and all(v is None for v in mv):
@@ -1110,7 +1135,7 @@ def _zero_coupling(df, anchor, amount_members, count_members, cap=10):
             if not ok:
                 n_fail += 1; mask[i] = True
     _, sample = _key_buckets(df, mask, cap=cap)
-    return n_checked, n_fail, sample, n_null, n_zero, n_active
+    return n_checked, n_fail, sample, n_null, n_zero, n_active, n_skip
 
 
 def _sampling_consistency(df, cap=10):
@@ -1144,7 +1169,8 @@ def _sampling_consistency(df, cap=10):
                       anomaly_buckets=sample, detail=note)]
 
 
-def tf_tier2_invariants(df):
+def tf_tier2_invariants(df, unvalued=None):
+    unvalued = unvalued or {}
     rows = []
     uniq_pairs = [("unique_suppliers", "supply_tx_count"),
                   ("unique_withdraw_users", "withdrawal_tx_count"),
@@ -1183,13 +1209,15 @@ def tf_tier2_invariants(df):
     ]
     for name, anchor, amts, cnts in families:
         if anchor in df.columns and all(c in df.columns for c in amts + cnts):
-            n, bad, sample, n_null, n_zero, n_active = _zero_coupling(df, anchor, amts, cnts)
+            n, bad, sample, n_null, n_zero, n_active, n_skip = _zero_coupling(
+                df, anchor, amts, cnts, skip=unvalued.get(name))
             rows.append(_t_record("T2", f"{name}: zero-coupling (count<=>amount<=>uniques)",
                                   anchor, n, bad,
                                   anomaly_columns=(",".join([anchor] + amts + cnts) if bad else ""),
                                   anomaly_buckets=sample,
                                   detail=f"all_null(quiet/gap)={n_null} structural_zero={n_zero} "
-                                         f"active={n_active}"))
+                                         f"active={n_active}"
+                                         + (f" unvalued(no price)={n_skip}" if unvalued.get(name) is not None else "")))
     if {"liquidation_debt_covered_value_usd", "liquidated_collateral_value_usd"} <= set(df.columns):
         n, bad, sample = _pair_le_num(df, "liquidation_debt_covered_value_usd",
                                       "liquidated_collateral_value_usd")
@@ -1387,10 +1415,11 @@ def tf_tier4_temporal(df, bucket_hours=None):
 
 # --- entry points: run all tiers and optionally save one tidy CSV per frame ---
 def validate_transformed_final(df, table_name="DF_common_final",
-                               results_dir="validation_results", save=True):
-    """Run Tiers 0-4 on the protocol-level feature matrix; return one tidy DataFrame."""
+                               results_dir="validation_results", save=True, unvalued=None):
+    """Run Tiers 0-4 on the protocol-level feature matrix; return one tidy DataFrame.
+    unvalued: {family: set of bucket stamps} from unpriced_event_buckets, passed to Tier 2."""
     # protocol-level frame, time_bucket keyed
-    out = pd.concat([tf_tier0_schema(df), tf_tier1_domain(df), tf_tier2_invariants(df),
+    out = pd.concat([tf_tier0_schema(df), tf_tier1_domain(df), tf_tier2_invariants(df, unvalued=unvalued),
                      tf_tier3_consistency(df), tf_tier4_temporal(df)], ignore_index=True)
     if save:
         from pathlib import Path
