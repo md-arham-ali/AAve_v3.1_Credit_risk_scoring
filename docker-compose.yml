@@ -50,9 +50,11 @@ services:
       # Only the key is injected. The 16 query ids are hardcoded in
       # process.ipynb cell 2, and their names start with digits, which are not
       # valid environment-variable names — so `env_file: .env` is avoided here.
-      # `:?` makes Compose fail fast with a clear message if it's unset, rather
-      # than starting a container that dies mid-fetch.
-      DUNE_API_KEY: ${DUNE_API_KEY:?set DUNE_API_KEY in .env (no spaces around =)}
+      # `:-` (optional, blank if unset): bringing up an unrelated service (mlflow,
+      # say) no longer needs a Dune key just because this service is in the same
+      # file. Running extraction itself without a real key still fails, just at
+      # the API call inside the container instead of at `compose up`.
+      DUNE_API_KEY: ${DUNE_API_KEY:-}
     volumes:
       - ./src:/app/src:rw
       - ./notebooks:/app/notebooks:rw

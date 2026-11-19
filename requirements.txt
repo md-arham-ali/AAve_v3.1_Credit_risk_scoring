@@ -28,6 +28,10 @@ xgboost==3.3.0
 lightgbm==4.6.0
 lifelines==0.30.3
 torch==2.12.1
+catboost==1.2.10           # model_zoo catboost entry (optional import: the entry is absent without it)
+statsmodels==0.15.0        # model_series.run_sarimax (optional import)
+patsy==1.0.3               # statsmodels dependency
+hmmlearn==0.3.3            # model_series.run_hmm (optional import)
 
 # --- experiment tracking ---
 mlflow==2.22.0             # NEW
